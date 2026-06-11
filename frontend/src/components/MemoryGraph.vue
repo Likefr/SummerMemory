@@ -521,7 +521,8 @@ const selectedDate = ref('')
 const selectedFiles = ref([])
 const maxTimelineCount = computed(() => Math.max(...timelineData.value.map(t => t.count), 1))
 let searchTimer = null
-const currentVersion = ref('v260608.1920')
+const currentVersion = ref('v260611.2351')
+let _previewFitTimer = null
 
 // Colors — 按路径前缀分类
 const CATEGORY_COLORS = {
@@ -706,7 +707,6 @@ function initGraph() {
 
     // ── Click 预览 — 区分点击和拖拽 ──
     let _downX = 0, _downY = 0, _downTime = 0
-    let _previewFitTimer = null
     container.addEventListener('pointerdown', (e) => {
       _downX = e.clientX
       _downY = e.clientY
@@ -832,46 +832,25 @@ let pulseRestoreTimer = null
 async function pulseNode(nodeId) {
   if (!graph.value) return
   try {
-    // 通过 ID 获取内部索引
     const idxArr = await graph.value.getPointIndicesByIds([String(nodeId)])
     if (!idxArr || idxArr.length === 0) return
     const realIdx = idxArr[0]
 
-    // 选中节点（白色聚焦环）
-    graph.value.selectPoints([realIdx], false)
-
-    // 增加漂浮力：降低引力 + 减小摩擦 + 给模拟脉冲
-    updateGraphConfig({
-      simulationGravity: 0.05,
-      simulationFriction: 0.5,
-      simulationImpulse: 1,
-    })
-
-    // 2 秒后取消选中 + 恢复模拟 + 5秒缓慢适配视图
-    if (pulseTimer) clearTimeout(pulseTimer)
-    pulseTimer = setTimeout(() => {
-      pulseTimer = null
-      try {
-        graph.value.selectPoints(null)
-        // 先恢复模拟参数让节点稳定下来
-        updateGraphConfig({
-          simulationGravity: simGravity.value,
-          simulationFriction: simFriction.value,
-        })
-        // 再缓慢适配视图
-        graph.value.fitView(5000)
-      } catch (e) { /* ignore */ }
-    }, 2000)
-
-    // 8 秒后给一个小脉冲 + 静默刷新
-    if (pulseRestoreTimer) clearTimeout(pulseRestoreTimer)
-    pulseRestoreTimer = setTimeout(() => {
-      pulseRestoreTimer = null
-      try {
-        updateGraphConfig({ simulationImpulse: 0.3 })
-      } catch (e) { /* ignore */ }
-      loadData()
-    }, 8000)
+    // 完全照搬点击节点的效果：居中放大，10秒后适配视图
+    try {
+      graph.value.pause()
+      setTimeout(() => {
+        graph.value.zoomToPoint(realIdx, 600, 90)
+        setTimeout(() => {
+          graph.value.unpause()
+        }, 800)
+      }, 100)
+      if (_previewFitTimer) clearTimeout(_previewFitTimer)
+      _previewFitTimer = setTimeout(() => {
+        _previewFitTimer = null
+        try { graph.value.fitView(5000) } catch(e) {}
+      }, 10000)
+    } catch (e) { /* ignore */ }
   } catch (e) {
     console.warn('[Graph] pulseNode error:', e)
   }
