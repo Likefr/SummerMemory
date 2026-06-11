@@ -73,30 +73,24 @@
 
 ### 混合搜索架构
 
-```
-                    输入查询："我之前买了什么水果？"
-                              │
-                 ┌────────────┴────────────┐
-                 │                         │
-          ┌──────▼──────┐          ┌───────▼───────┐
-          │  🧬 向量搜索  │          │  📖 BM25 搜索  │
-          │  理解"意思"  │          │  精确"匹配"   │
-          │  权重: 60%   │          │  权重: 40%    │
-          └──────┬──────┘          └───────┬───────┘
-                 │                         │
-                 │    "苹果"向量 ≈ "水果"    │    命中"买"等关键词
-                 │    得分: 0.85            │    得分: 0.60
-                 └────────────┬────────────┘
-                              │
-                    ┌─────────▼─────────┐
-                    │   🎯 混合排序融合   │
-                    │  0.85×0.6 + 0.60×0.4│
-                    │   最终得分: 0.75    │
-                    └─────────┬─────────┘
-                              │
-                    ┌─────────▼─────────┐
-                    │   📋 返回最佳结果   │
-                    └───────────────────┘
+```mermaid
+flowchart TD
+    Q["🔍 输入查询：'我之前买了什么水果？'"]
+
+    Q --> Vector["🧬 向量搜索\n理解'意思'\n权重: 60%"]
+    Q --> BM25["📖 BM25 搜索\n精确'匹配'\n权重: 40%"]
+
+    Vector -->|"'苹果'向量 ≈ '水果'\n得分: 0.85"| Merge
+    BM25 -->|"命中'买'等关键词\n得分: 0.60"| Merge
+
+    Merge["🎯 混合排序融合\n0.85 × 0.6 + 0.60 × 0.4\n最终得分: 0.75"]
+    Merge --> Result["📋 返回最佳结果"]
+
+    style Q fill:#1e293b,stroke:#3b82f6,color:#e2e8f0
+    style Vector fill:#1e3a5f,stroke:#3b82f6,color:#e2e8f0
+    style BM25 fill:#1e3a5f,stroke:#10b981,color:#e2e8f0
+    style Merge fill:#1e293b,stroke:#f59e0b,color:#e2e8f0
+    style Result fill:#065f46,stroke:#10b981,color:#e2e8f0
 ```
 
 ### 技术原理详解
@@ -285,34 +279,43 @@ AI 回答："你之前买了苹果和香蕉，都是水果哦！🍎🍌"
 
 三层架构，**全部本地运行，零费用**：
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                  🧠 SummerMemory Server                  │
-│               Python HTTP API (Port: 11435)              │
-│                                                          │
-│   🔍 混合搜索引擎（向量 + BM25）                          │
-│   📊 图谱数据 API                                        │
-│   📁 记忆索引管理                                        │
-│   📈 统计分析 & 活动日志                                  │
-│   🔄 systemd 管理 · 开机自启 · 故障自愈                   │
-└──────────────┬──────────────────────┬────────────────────┘
-               │                      │
-      ┌────────▼─────────┐   ┌───────▼──────────────┐
-      │   🐘 PostgreSQL   │   │      🦙 Ollama        │
-      │   + pgvector      │   │   bge-small-zh-v1.5   │
-      │   (Port: 5432)    │   │   (Port: 11434)       │
-      │                    │   │                       │
-      │   📦 向量存储       │   │   🧬 Embedding 推理   │
-      │   📖 全文索引       │   │   🇨🇳 中文优化模型     │
-      │   📊 关系数据       │   │   ⚡ CPU 即可运行      │
-      └──────────────────┘   └───────────────────────┘
-               │
-      ┌────────▼─────────┐
-      │   🎨 Frontend      │
-      │   Vue 3 + force-   │
-      │   graph / Cosmo    │
-      │   图谱可视化        │
-      └──────────────────┘
+```mermaid
+flowchart TB
+    subgraph Server["🧠 SummerMemory Server — Python HTTP API :11435"]
+        direction LR
+        S1["🔍 混合搜索引擎"]
+        S2["📊 图谱数据 API"]
+        S3["📁 记忆索引管理"]
+        S4["📈 统计 & 活动日志"]
+        S5["🔄 systemd · 开机自启 · 故障自愈"]
+    end
+
+    subgraph DB["🐘 PostgreSQL + pgvector :5432"]
+        D1["📦 向量存储"]
+        D2["📖 全文索引"]
+        D3["📊 关系数据"]
+    end
+
+    subgraph Ollama["🦙 Ollama — bge-small-zh-v1.5 :11434"]
+        O1["🧬 Embedding 推理"]
+        O2["🇨🇳 中文优化模型"]
+        O3["⚡ CPU 即可运行"]
+    end
+
+    subgraph Frontend["🎨 Frontend — Vue 3 + Cosmograph"]
+        F1["🕸️ 图谱可视化"]
+        F2["🌐 中英文切换"]
+        F3["📱 响应式设计"]
+    end
+
+    Server <--> DB
+    Server <--> Ollama
+    Frontend --> Server
+
+    style Server fill:#1e293b,stroke:#3b82f6,color:#e2e8f0
+    style DB fill:#1a2744,stroke:#336791,color:#e2e8f0
+    style Ollama fill:#1a2744,stroke:#f97316,color:#e2e8f0
+    style Frontend fill:#1a2744,stroke:#10b981,color:#e2e8f0
 ```
 
 **核心数据流：**
