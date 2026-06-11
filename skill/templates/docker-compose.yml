@@ -1,0 +1,76 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: summermemory-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-summermemory}
+      POSTGRES_USER: ${DB_USER:-summer}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-summer2026}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-summer} -d ${DB_NAME:-summermemory}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: summermemory-ollama
+    restart: unless-stopped
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  summermemory:
+    image: python:3.11-slim
+    container_name: summermemory-server
+    restart: unless-stopped
+    working_dir: /app
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-summermemory}
+      DB_USER: ${DB_USER:-summer}
+      DB_PASSWORD: ${DB_PASSWORD:-summer2026}
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-quentinz/bge-small-zh-v1.5}
+      MEMORY_DIR: /app/memory
+      SERVER_PORT: ${SERVER_PORT:-11435}
+    ports:
+      - "${SERVER_PORT:-11435}:${SERVER_PORT:-11435}"
+    volumes:
+      - ./memory:/app/memory:ro
+      - ./memory_system.py:/app/memory_system.py:ro
+      - ./memory_server.py:/app/memory_server.py:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    command: >
+      bash -c "
+        pip install --no-cache-dir psycopg2-binary requests jieba flask numpy &&
+        python memory_server.py
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${SERVER_PORT:-11435}/version"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+  ollama_data:

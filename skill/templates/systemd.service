@@ -1,0 +1,33 @@
+[Unit]
+Description=SummerMemory AI Memory Server
+After=network.target postgresql.service ollama.service
+Wants=postgresql.service ollama.service
+
+[Service]
+Type=simple
+User=summermemory
+Group=summermemory
+WorkingDirectory=/opt/summermemory
+ExecStart=/usr/bin/python3 /opt/summermemory/memory_server.py
+Restart=on-failure
+RestartSec=5
+
+Environment=DB_HOST=localhost
+Environment=DB_PORT=5432
+Environment=DB_NAME=summermemory
+Environment=DB_USER=summer
+Environment=DB_PASSWORD=summer2026
+Environment=OLLAMA_HOST=http://localhost:11434
+Environment=OLLAMA_MODEL=quentinz/bge-small-zh-v1.5
+Environment=MEMORY_DIR=/opt/summermemory/memory
+Environment=SERVER_PORT=11435
+
+# 安全限制
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/summermemory
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

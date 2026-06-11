@@ -1,0 +1,65 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg15
+    container_name: summer-memory-db
+    environment:
+      POSTGRES_DB: summer_memory
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-summer2026}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: summer-memory-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # 如需 GPU 加速，取消以下注释
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    restart: unless-stopped
+
+  summer-memory-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: summer-memory-server
+    ports:
+      - "11435:11435"
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=summer_memory
+      - DB_USER=postgres
+      - DB_PASSWORD=${DB_PASSWORD:-summer2026}
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=quentinz/bge-small-zh-v1.5
+      - TZ=Asia/Shanghai
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  ollama_data:
