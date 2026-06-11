@@ -8,15 +8,19 @@ import json
 import sys
 import time
 import hashlib
+import re
+import asyncio
+import threading
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Set
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import urllib.parse
 
 import requests
 import psycopg2
 import jieba
+import websockets
 
 # 配置
 DB_CONFIG = {
@@ -34,15 +38,83 @@ OLLAMA_MODEL = "quentinz/bge-small-zh-v1.5"
 WORKSPACE = Path("/root/.openclaw/workspace")
 PORT = 11435
 
+# 分块参数
+MAX_CHUNK_CHARS = 800  # 每块最大字符数（中文约 400-500 token，安全在 512 内）
+
+
+def chunk_markdown(text: str, max_chars: int = MAX_CHUNK_CHARS) -> List[str]:
+    """
+    按 Markdown 标题（##/###）+ 空行分段落，每块不超过 max_chars 字符。
+    超长的块按 max_chars 硬切。空块被丢弃。
+    """
+    # 按标题行（## ... 或 ### ... 等）拆分，保留标题行
+    # 模式：匹配行首的 ## 开头（至少2个#）
+    header_pattern = re.compile(r'^(#{2,}\s.+)$', re.MULTILINE)
+
+    parts = []
+    last_end = 0
+    for m in header_pattern.finditer(text):
+        if m.start() > last_end:
+            section = text[last_end:m.start()].strip()
+            if section:
+                parts.append(section)
+        last_end = m.start()
+    # 最后一段
+    remaining = text[last_end:].strip()
+    if remaining:
+        parts.append(remaining)
+
+    # 如果没有标题，整篇作为一段
+    if not parts:
+        stripped = text.strip()
+        if stripped:
+            parts = [stripped]
+        else:
+            return []
+
+    # 每段如果太长，按空行再拆，或硬切
+    chunks = []
+    for part in parts:
+        if len(part) <= max_chars:
+            chunks.append(part)
+        else:
+            # 按空行再拆分
+            sub_parts = re.split(r'\n\s*\n', part)
+            current = ""
+            for sp in sub_parts:
+                sp = sp.strip()
+                if not sp:
+                    continue
+                if len(current) + len(sp) + 2 <= max_chars:
+                    if current:
+                        current += "\n\n" + sp
+                    else:
+                        current = sp
+                else:
+                    if current:
+                        chunks.append(current)
+                    # 如果单段超过 max_chars，硬切
+                    if len(sp) > max_chars:
+                        for i in range(0, len(sp), max_chars):
+                            chunks.append(sp[i:i + max_chars])
+                    else:
+                        current = sp
+            if current:
+                chunks.append(current)
+
+    # 过滤空块
+    return [c for c in chunks if c.strip()]
+
+
 class MemorySystem:
     def __init__(self):
         self.conn = self._get_connection()
         self._ensure_tables()
-    
+
     def _get_connection(self):
         """创建新的数据库连接"""
         return psycopg2.connect(**DB_CONFIG)
-    
+
     def _ensure_connection(self):
         """检查连接是否有效，先 rollback 清理事务状态，无效则重连"""
         try:
@@ -52,10 +124,10 @@ class MemorySystem:
         except (psycopg2.InterfaceError, psycopg2.OperationalError):
             print("数据库连接已关闭，正在重连...")
             self.conn = self._get_connection()
-    
+
     def _ensure_tables(self):
         with self.conn.cursor() as cur:
-            # 1. 确保表存在
+            # 1. 确保表存在（含 chunk_index 列）
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS memories (
                     id SERIAL PRIMARY KEY,
@@ -65,6 +137,7 @@ class MemorySystem:
                     content_tsv TSVECTOR,
                     metadata JSONB DEFAULT '{}',
                     hash TEXT,
+                    chunk_index INTEGER DEFAULT 0,
                     created_at TIMESTAMP DEFAULT NOW(),
                     updated_at TIMESTAMP DEFAULT NOW()
                 );
@@ -81,7 +154,19 @@ class MemorySystem:
                     END IF;
                 END $$;
             """)
-            # 3. 创建索引（列已存在）
+            # 3. 如果表已存在但没有 chunk_index 列，添加它
+            cur.execute("""
+                DO $$ 
+                BEGIN 
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns 
+                        WHERE table_name='memories' AND column_name='chunk_index'
+                    ) THEN 
+                        ALTER TABLE memories ADD COLUMN chunk_index INTEGER DEFAULT 0;
+                    END IF;
+                END $$;
+            """)
+            # 4. 创建索引
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS memories_embedding_idx 
                 ON memories USING ivfflat (embedding vector_cosine_ops) 
@@ -93,7 +178,10 @@ class MemorySystem:
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS memories_hash_idx ON memories (hash);
             """)
-            # 4. activity 日志表（如果不存在）
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS memories_path_chunk_idx ON memories (path, chunk_index);
+            """)
+            # 5. activity 日志表（如果不存在）
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS memory_activity (
                     id SERIAL PRIMARY KEY,
@@ -104,8 +192,8 @@ class MemorySystem:
                 );
             """)
             self.conn.commit()
-    
-    def get_embedding(self, text: str) -> List[float]:
+
+    def get_embedding(self, text: str) -> Optional[List[float]]:
         """调用 Ollama 获取文本嵌入向量，失败返回 None"""
         try:
             resp = requests.post(
@@ -125,88 +213,114 @@ class MemorySystem:
         except Exception as e:
             print(f"Embedding error: {e}")
             return None
-    
+
     def _segment_text(self, text: str) -> str:
         """为全文搜索分词"""
         return ' '.join(jieba.cut(text))
-    
+
     def index_file(self, path: Path) -> Dict[str, Any]:
-        """索引单个文件"""
+        """索引单个文件（按 chunk 拆分后逐块索引）"""
         try:
             content = path.read_text(encoding='utf-8', errors='replace')
         except Exception as e:
             return {'path': str(path), 'status': 'error', 'message': str(e)}
-        
+
         # 统一使用相对路径（memory/xxx），避免绝对路径导致重复
         rel_path = str(path).replace(str(WORKSPACE) + '/', '')
-        
-        content_hash = hashlib.md5(content.encode()).hexdigest()
-        
-        # 检查是否已索引且未变更（同时检查相对路径和绝对路径）
-        with self.conn.cursor() as cur:
-            cur.execute("SELECT hash, id, embedding FROM memories WHERE path IN (%s, %s) ORDER BY updated_at DESC LIMIT 1", (rel_path, str(path)))
-            existing = cur.fetchone()
-            if existing and existing[0] == content_hash and existing[2] is not None:
-                return {'path': str(path), 'status': 'unchanged'}
-        
-        # 生成 embedding（失败时跳过向量写入）
-        embedding = self.get_embedding(content[:2000])  # 截取前2000字符
-        
-        # 分词
-        segmented = self._segment_text(content)
-        
-        # 提取元数据（文件大小、修改时间）
+
+        # 过滤空文件
+        if not content.strip():
+            return {'path': str(path), 'status': 'skipped', 'message': 'empty file'}
+
+        # 分块
+        chunks = chunk_markdown(content, MAX_CHUNK_CHARS)
+        if not chunks:
+            chunks = [content[:MAX_CHUNK_CHARS]]
+
+        # 提取文件级元数据
         metadata = {
             'size': path.stat().st_size,
-            'mtime': datetime.fromtimestamp(path.stat().st_mtime).isoformat()
+            'mtime': datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
+            'total_chunks': len(chunks),
         }
-        
+
         self._ensure_connection()
+
+        # 检查该文件已有 chunk 的 hash 集合，用于判断是否全未变更
+        new_hashes = [hashlib.md5(c.encode()).hexdigest() for c in chunks]
         with self.conn.cursor() as cur:
-            if embedding is not None:
-                # embedding 成功：正常写入向量
-                if existing:
+            cur.execute(
+                "SELECT hash, chunk_index FROM memories WHERE path = %s ORDER BY chunk_index",
+                (rel_path,)
+            )
+            existing_rows = cur.fetchall()
+
+        # 快速判断：如果 chunk 数量一样且每个 hash 都一样，跳过
+        existing_map = {row[1]: row[0] for row in existing_rows}
+        if len(existing_rows) == len(chunks):
+            all_same = True
+            for i, h in enumerate(new_hashes):
+                if existing_map.get(i) != h:
+                    all_same = False
+                    break
+            if all_same:
+                # 还需要确认 embedding 都存在
+                with self.conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT COUNT(*) FROM memories WHERE path = %s AND embedding IS NOT NULL",
+                        (rel_path,)
+                    )
+                    emb_count = cur.fetchone()[0]
+                if emb_count == len(chunks):
+                    return {'path': str(path), 'status': 'unchanged', 'chunks': len(chunks)}
+
+        # 删除该文件的所有旧 chunk，重新插入
+        with self.conn.cursor() as cur:
+            # 同时清理可能的绝对路径旧记录
+            cur.execute("DELETE FROM memories WHERE path IN (%s, %s)", (rel_path, str(path)))
+
+        # 逐块写入
+        status = 'indexed'
+        for i, chunk_content in enumerate(chunks):
+            chunk_hash = new_hashes[i]
+            embedding = self.get_embedding(chunk_content[:MAX_CHUNK_CHARS])
+            segmented = self._segment_text(chunk_content)
+            chunk_meta = dict(metadata)
+            chunk_meta['chunk_index'] = i
+            chunk_meta['chunk_hash'] = chunk_hash
+
+            with self.conn.cursor() as cur:
+                if embedding is not None:
                     cur.execute("""
-                        UPDATE memories 
-                        SET path = %s, content = %s, embedding = %s::vector, content_tsv = to_tsvector('simple', %s),
-                            metadata = %s::jsonb, hash = %s, updated_at = NOW()
-                        WHERE id = %s
-                    """, (rel_path, content, embedding, segmented, json.dumps(metadata, ensure_ascii=False), content_hash, existing[1]))
+                        INSERT INTO memories (path, content, embedding, content_tsv, metadata, hash, chunk_index)
+                        VALUES (%s, %s, %s::vector, to_tsvector('simple', %s), %s::jsonb, %s, %s)
+                    """, (rel_path, chunk_content, embedding, segmented,
+                          json.dumps(chunk_meta, ensure_ascii=False), chunk_hash, i))
                 else:
                     cur.execute("""
-                        INSERT INTO memories (path, content, embedding, content_tsv, metadata, hash)
-                        VALUES (%s, %s, %s::vector, to_tsvector('simple', %s), %s::jsonb, %s)
-                    """, (rel_path, content, embedding, segmented, json.dumps(metadata, ensure_ascii=False), content_hash))
-            else:
-                # embedding 失败：只写文本，不写向量（下次索引时补上）
-                if existing:
-                    cur.execute("""
-                        UPDATE memories 
-                        SET path = %s, content = %s, content_tsv = to_tsvector('simple', %s),
-                            metadata = %s::jsonb, hash = %s, updated_at = NOW()
-                        WHERE id = %s
-                    """, (rel_path, content, segmented, json.dumps(metadata, ensure_ascii=False), content_hash, existing[1]))
-                else:
-                    cur.execute("""
-                        INSERT INTO memories (path, content, content_tsv, metadata, hash)
-                        VALUES (%s, %s, to_tsvector('simple', %s), %s::jsonb, %s)
-                    """, (rel_path, content, segmented, json.dumps(metadata, ensure_ascii=False), content_hash))
-        
+                        INSERT INTO memories (path, content, content_tsv, metadata, hash, chunk_index)
+                        VALUES (%s, %s, to_tsvector('simple', %s), %s::jsonb, %s, %s)
+                    """, (rel_path, chunk_content, segmented,
+                          json.dumps(chunk_meta, ensure_ascii=False), chunk_hash, i))
+
+            if existing_map and i in existing_map:
+                status = 'updated'
+
         self.conn.commit()
-        return {'path': str(path), 'status': 'updated' if existing else 'indexed'}
-    
+        return {'path': str(path), 'status': status, 'chunks': len(chunks)}
+
     def index_workspace(self) -> Dict[str, Any]:
         """索引工作区所有可索引的文件"""
         self._ensure_connection()
         results = {'indexed': 0, 'updated': 0, 'unchanged': 0, 'failed': 0, 'details': []}
-        
+
         memory_dir = WORKSPACE / 'memory'
         if not memory_dir.exists():
             return results
-        
+
         # 支持的文件扩展名
         extensions = {'.md', '.py', '.js', '.vue', '.ts', '.json', '.yaml', '.yml', '.html', '.css', '.txt'}
-        
+
         for f in sorted(memory_dir.rglob('*')):
             if f.is_file() and f.suffix in extensions:
                 # 跳过梦境目录和其他无关目录
@@ -218,12 +332,12 @@ class MemorySystem:
                 result = self.index_file(f)
                 results[result['status']] = results.get(result['status'], 0) + 1
                 results['details'].append(result)
-        
+
         self.conn.commit()
         # 记录活动
         self._log_activity('index_workspace', 'memory/', None)
         return results
-    
+
     def _log_activity(self, action: str, path: str = None, query: str = None):
         try:
             with self.conn.cursor() as cur:
@@ -234,19 +348,28 @@ class MemorySystem:
             self.conn.commit()
         except:
             pass
-    
+        # 向所有 WebSocket 客户端广播 activity 事件
+        try:
+            ws_manager.broadcast({
+                "type": "activity",
+                "action": action,
+                "path": path,
+                "query": query,
+            })
+        except Exception:
+            pass
+
     def search(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
         """混合搜索：先尝试向量搜索，失败则回退到全文搜索"""
         self._ensure_connection()
-        self._log_activity('search', query=query)
-        
+
         # 向量搜索
         embedding = self.get_embedding(query)
         if embedding:
             try:
                 with self.conn.cursor() as cur:
                     cur.execute("""
-                        SELECT path, content, metadata, 
+                        SELECT path, content, metadata, chunk_index,
                                1 - (embedding <=> %s::vector) AS similarity
                         FROM memories
                         WHERE embedding IS NOT NULL
@@ -257,18 +380,21 @@ class MemorySystem:
                     for row in cur.fetchall():
                         results.append({
                             'path': row[0],
-                            'content': row[1][:500],  # 截取前500字符
+                            'content': row[1][:500],
                             'metadata': row[2],
-                            'similarity': round(row[3], 4)
+                            'chunk_index': row[3],
+                            'similarity': round(row[4], 4)
                         })
+                    # 广播搜索命中的文件路径
+                    self._log_activity('search', path=results[0]['path'] if results else None, query=query)
                     return results
             except Exception as e:
                 print(f"Vector search error: {e}")
-        
+
         # 回退：全文搜索
         with self.conn.cursor() as cur:
             cur.execute("""
-                SELECT path, content, metadata,
+                SELECT path, content, metadata, chunk_index,
                        ts_rank(content_tsv, plainto_tsquery('simple', %s)) AS rank
                 FROM memories
                 WHERE content_tsv @@ plainto_tsquery('simple', %s)
@@ -281,84 +407,86 @@ class MemorySystem:
                     'path': row[0],
                     'content': row[1][:500],
                     'metadata': row[2],
-                    'similarity': round(row[3], 4)
+                    'chunk_index': row[3],
+                    'similarity': round(row[4], 4)
                 })
+            # 广播搜索命中的文件路径
+            self._log_activity('search', path=results[0]['path'] if results else None, query=query)
             return results
-    
+
     def get_stats(self) -> Dict[str, Any]:
         """获取系统统计信息"""
         with self.conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM memories")
-            total = cur.fetchone()[0]
-            
+            total_chunks = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(DISTINCT path) FROM memories")
+            total_files = cur.fetchone()[0]
+
             cur.execute("""
                 SELECT path, updated_at FROM memories 
                 ORDER BY updated_at DESC LIMIT 1
             """)
             last = cur.fetchone()
-            
+
+            # 按目录统计（按文件去重）
             cur.execute("""
-                SELECT COUNT(DISTINCT path) FROM memories
-            """)
-            unique_paths = cur.fetchone()[0]
-            
-            # 按目录统计
-            cur.execute("""
-                SELECT SPLIT_PART(path, '/', 4) as dir, COUNT(*) as cnt
+                SELECT SPLIT_PART(path, '/', 4) as dir, COUNT(DISTINCT path) as cnt
                 FROM memories 
                 GROUP BY dir 
                 ORDER BY cnt DESC
             """)
             dirs = {row[0]: row[1] for row in cur.fetchall()}
-        
-        # 统计总chunks数
-        with self.conn.cursor() as cur:
-            cur.execute("SELECT SUM(LENGTH(content) / 500) FROM memories WHERE content IS NOT NULL")
-            total_chunks = cur.fetchone()[0] or len(path_list)
-        
+
         return {
-            'total_files': unique_paths,
-            'total_chunks': int(total_chunks),
-            'total_memories': total,
-            'unique_files': unique_paths,
+            'total_files': total_files,
+            'total_chunks': total_chunks,
+            'total_memories': total_chunks,
+            'unique_files': total_files,
             'last_updated': last[1].isoformat() if last else None,
             'directories': dirs
         }
-    
+
     def get_graph_data(self) -> Dict[str, Any]:
         """获取关系图数据"""
         with self.conn.cursor() as cur:
-            # 获取所有节点（按 path 去重）
+            # 按文件 path 分组，统计实际 chunk 数
             cur.execute("""
-                SELECT DISTINCT ON (path) path, content, metadata
+                SELECT path, COUNT(*) as chunk_count,
+                       MAX(updated_at) as last_updated
                 FROM memories
-                ORDER BY path, updated_at DESC
+                GROUP BY path
+                ORDER BY path
             """)
+            file_rows = cur.fetchall()
+
             nodes = []
             file_nodes = set()
-            path_counter = {}
+            # 缓存每个文件的 metadata（取第一个 chunk 的）
+            file_meta = {}
+            cur.execute("""
+                SELECT DISTINCT ON (path) path, metadata
+                FROM memories
+                ORDER BY path, chunk_index
+            """)
             for row in cur.fetchall():
+                file_meta[row[0]] = row[1] or {}
+
+            for row in file_rows:
                 path = row[0]
-                # 提取文件名作显示名
+                chunk_count = row[1]
                 filename = Path(path).name
-                if path not in path_counter:
-                    path_counter[path] = 1
-                else:
-                    path_counter[path] += 1
-                
-                # 确定节点类型
-                metadata = row[2] or {}
+
+                metadata = file_meta.get(path, {})
                 size = metadata.get('size', 0)
-                
-                # 估算chunks数（基于文件大小，每500字一个chunk）
-                content = row[1] or ''
-                chunks = max(1, len(content) // 500)
-                
+                # 使用实际 chunk 记录数
+                chunks = chunk_count
+
                 node = {
                     'id': path,
                     'name': filename,
                     'type': 'file',
-                    'val': max(1, min(10, size / 1000)),  # 归一化大小
+                    'val': max(1, min(10, size / 1000)),
                     'group': Path(path).parent.name or 'root',
                     'path': path,
                     'size': size,
@@ -368,54 +496,125 @@ class MemorySystem:
                 }
                 file_nodes.add(path)
                 nodes.append(node)
-            
-            # 构建链接（基于内容相似度和路径关系）
+
+            # 构建链接
             links = []
             path_list = sorted(file_nodes)
-            
+
             # 基于目录关系的链接
             for i, path1 in enumerate(path_list):
                 p1 = Path(path1)
                 for path2 in path_list[i+1:]:
                     p2 = Path(path2)
-                    # 如果文件在同一目录，建立链接
                     if p1.parent == p2.parent:
                         links.append({
                             'source': path1,
                             'target': path2,
                             'weight': 0.3
                         })
-                    # 如果文件名相关（共享前缀）
                     elif p1.stem[:10] == p2.stem[:10]:
                         links.append({
                             'source': path1,
                             'target': path2,
                             'weight': 0.5
                         })
-            
-            # 基于内容重叠的链接
-            with self.conn.cursor() as cur:
+
+            # 基于内容重叠的链接（逐 chunk 比较取最高相似度）
+            with self.conn.cursor() as cur2:
                 for i, path1 in enumerate(path_list):
                     for path2 in path_list[i+1:]:
-                        cur.execute("""
-                            SELECT 1 - (m1.embedding <=> m2.embedding) AS similarity
+                        cur2.execute("""
+                            SELECT MAX(1 - (m1.embedding <=> m2.embedding)) AS similarity
                             FROM memories m1, memories m2
                             WHERE m1.path = %s AND m2.path = %s
                             AND m1.embedding IS NOT NULL AND m2.embedding IS NOT NULL
-                            LIMIT 1
                         """, (path1, path2))
-                        row = cur.fetchone()
-                        if row and row[0] > 0.8:
+                        row = cur2.fetchone()
+                        if row and row[0] is not None and row[0] > 0.8:
                             links.append({
                                 'source': path1,
                                 'target': path2,
-                                'weight': row[0]
+                                'weight': float(row[0])
                             })
-        
+
         return {
             'nodes': nodes,
             'links': links
         }
+
+# ---- WebSocket 广播管理 ----
+
+class WebSocketManager:
+    """管理所有 WebSocket 客户端连接，并提供广播方法"""
+
+    def __init__(self):
+        self._clients: Set = set()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def set_loop(self, loop: asyncio.AbstractEventLoop):
+        self._loop = loop
+
+    def register(self, ws):
+        self._clients.add(ws)
+
+    def unregister(self, ws):
+        self._clients.discard(ws)
+
+    def broadcast(self, message: dict):
+        """线程安全地向所有 WS 客户端广播 JSON 消息"""
+        if not self._clients or not self._loop:
+            return
+        data = json.dumps(message, ensure_ascii=False)
+        # 从任意线程调度到 asyncio 事件循环
+        for ws in list(self._clients):
+            self._loop.call_soon_threadsafe(
+                asyncio.ensure_future, self._safe_send(ws, data)
+            )
+
+    @staticmethod
+    async def _safe_send(ws, data: str):
+        try:
+            await ws.send(data)
+        except Exception:
+            pass
+
+
+ws_manager = WebSocketManager()
+
+
+async def _ws_handler(websocket):
+    """单个 WS 连接的生命周期管理"""
+    ws_manager.register(websocket)
+    try:
+        # 保持连接，等待客户端断开
+        async for _ in websocket:
+            pass
+    except websockets.ConnectionClosed:
+        pass
+    finally:
+        ws_manager.unregister(websocket)
+
+
+def _run_ws_server():
+    """在独立线程中运行的 asyncio 事件循环"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    ws_manager.set_loop(loop)
+
+    async def start():
+        return await websockets.serve(
+            _ws_handler,
+            "0.0.0.0",
+            8890,
+            loop=loop,
+        )
+
+    server = loop.run_until_complete(start())
+    print(f"WebSocket server running on port 8890")
+    loop.run_forever()
+
+
+# ---- 全局 MemorySystem 实例 ----
 
 memory = MemorySystem()
 
@@ -427,20 +626,19 @@ class MemoryHandler(BaseHTTPRequestHandler):
         parsed_path = urllib.parse.urlparse(self.path)
         path = parsed_path.path
         params = urllib.parse.parse_qs(parsed_path.query)
-        
+
         # 公开端点
         if path == '/search':
             query = params.get('query', [''])[0]
-            limit = min(int(params.get('limit', [5])[0]), 20)  # 限制最多20条
+            limit = min(int(params.get('limit', [5])[0]), 20)
             result = memory.search(query, limit)
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             self.wfile.write(json.dumps(result, ensure_ascii=False).encode())
-        
+
         elif path == '/activity':
-            # 返回最近的活动记录
             limit = min(int(params.get('limit', [10])[0]), 50)
             with memory.conn.cursor() as cur:
                 cur.execute("""
@@ -462,7 +660,7 @@ class MemoryHandler(BaseHTTPRequestHandler):
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             self.wfile.write(json.dumps(activities, ensure_ascii=False).encode())
-        
+
         elif path == '/stats':
             result = memory.get_stats()
             self.send_response(200)
@@ -470,7 +668,7 @@ class MemoryHandler(BaseHTTPRequestHandler):
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             self.wfile.write(json.dumps(result, ensure_ascii=False).encode())
-        
+
         elif path == '/graph-data':
             result = memory.get_graph_data()
             self.send_response(200)
@@ -478,12 +676,11 @@ class MemoryHandler(BaseHTTPRequestHandler):
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             self.wfile.write(json.dumps(result, ensure_ascii=False).encode())
-        
+
         elif path == '/version':
-            # 返回数据版本（时间戳）+ 前端版本号
             try:
                 memory._ensure_connection()
-                memory.conn.rollback()  # 清理可能的失败事务
+                memory.conn.rollback()
                 with memory.conn.cursor() as cur:
                     cur.execute("SELECT EXTRACT(EPOCH FROM MAX(updated_at))::bigint FROM memories")
                     result = cur.fetchone()
@@ -499,12 +696,11 @@ class MemoryHandler(BaseHTTPRequestHandler):
                 'version': version,
                 'frontend': 'v260608.1920'
             }).encode())
-        
+
         elif path == '/timeline':
-            # 时间轴数据：按天统计记忆数量
             with memory.conn.cursor() as cur:
                 cur.execute("""
-                    SELECT DATE(created_at) as d, COUNT(*) as cnt,
+                    SELECT DATE(created_at) as d, COUNT(DISTINCT path) as cnt,
                            json_agg(DISTINCT path) as paths
                     FROM memories 
                     GROUP BY d 
@@ -517,14 +713,14 @@ class MemoryHandler(BaseHTTPRequestHandler):
                     timeline.append({
                         'date': d.isoformat() if d else '',
                         'count': cnt,
-                        'files': file_names[:20]  # 最多显示20个文件名
+                        'files': file_names[:20]
                     })
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             self.wfile.write(json.dumps({'timeline': timeline}).encode())
-        
+
         # 内部端点 - 只允许本地访问
         elif path == '/index':
             client_ip = self.client_address[0]
@@ -538,15 +734,20 @@ class MemoryHandler(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps(result, ensure_ascii=False).encode())
-        
+
         else:
             self.send_response(404)
             self.end_headers()
-    
+
     def log_message(self, format, *args):
         pass  # 禁用日志
 
 if __name__ == '__main__':
+    # 启动 WebSocket 服务线程
+    ws_thread = threading.Thread(target=_run_ws_server, daemon=True, name="ws-server")
+    ws_thread.start()
+
+    # 启动 HTTP 服务（阻塞主线程）
     server = HTTPServer(('0.0.0.0', PORT), MemoryHandler)
-    print(f"SummerMemory server running on port {PORT}")
+    print(f"SummerMemory HTTP server running on port {PORT}")
     server.serve_forever()
