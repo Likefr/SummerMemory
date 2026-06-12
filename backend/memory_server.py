@@ -33,13 +33,14 @@ DB_CONFIG = {
 
 # Ollama 配置
 OLLAMA_BASE_URL = "http://localhost:11434"
-OLLAMA_MODEL = "quentinz/bge-small-zh-v1.5"
+OLLAMA_MODEL = "jina-embeddings-v2-base-zh"
+OLLAMA_MODEL_OLD = "quentinz/bge-small-zh-v1.5"  # 旧模型保留，不删除
 
 WORKSPACE = Path("/root/.openclaw/workspace")
 PORT = 11435
 
 # 分块参数
-MAX_CHUNK_CHARS = 800  # 每块最大字符数（中文约 400-500 token，安全在 512 内）
+MAX_CHUNK_CHARS = 800  # 每块最大字符数（jina-embeddings-v2-base-zh 支持 8192 tokens，800字符足够安全）
 
 
 def chunk_markdown(text: str, max_chars: int = MAX_CHUNK_CHARS) -> List[str]:
@@ -133,7 +134,7 @@ class MemorySystem:
                     id SERIAL PRIMARY KEY,
                     path TEXT NOT NULL,
                     content TEXT NOT NULL,
-                    embedding vector(512),
+                    embedding vector(768),
                     content_tsv TSVECTOR,
                     metadata JSONB DEFAULT '{}',
                     hash TEXT,
@@ -561,6 +562,14 @@ class WebSocketManager:
     def unregister(self, ws):
         self._clients.discard(ws)
 
+    @property
+    def count(self):
+        return len(self._clients)
+
+    def broadcast_online_count(self):
+        """广播当前在线人数"""
+        self.broadcast({"type": "online_count", "count": self.count})
+
     def broadcast(self, message: dict):
         """线程安全地向所有 WS 客户端广播 JSON 消息"""
         if not self._clients or not self._loop:
@@ -586,6 +595,7 @@ ws_manager = WebSocketManager()
 async def _ws_handler(websocket):
     """单个 WS 连接的生命周期管理"""
     ws_manager.register(websocket)
+    ws_manager.broadcast_online_count()
     try:
         # 保持连接，等待客户端断开
         async for _ in websocket:
@@ -594,6 +604,7 @@ async def _ws_handler(websocket):
         pass
     finally:
         ws_manager.unregister(websocket)
+        ws_manager.broadcast_online_count()
 
 
 def _run_ws_server():
@@ -695,7 +706,7 @@ class MemoryHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({
                 'version': version,
-                'frontend': 'v260612.0855'
+                'frontend': 'v260612.2146'
             }).encode())
 
         elif path == '/timeline':
