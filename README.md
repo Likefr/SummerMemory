@@ -10,7 +10,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![Vue](https://img.shields.io/badge/Vue-3.x-brightgreen.svg)](https://vuejs.org/)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-pgvector-336791.svg)](https://github.com/pgvector/pgvector)
-[![Ollama](https://img.shields.io/badge/Ollama-bge--small--zh-orange.svg)](https://ollama.ai/)
+[![Ollama](https://img.shields.io/badge/Ollama-jina--embeddings--v2--base--zh-orange.svg)](https://ollama.ai/)
 
 </div>
 
@@ -57,7 +57,7 @@
 | 隐私 | **零泄露风险** | 本地 | 数据上传第三方 |
 | 全文搜索 | BM25 + jieba | 不支持 | 有 |
 | 中文分词 | jieba 深度优化 | 无 | 通用分词 |
-| 向量维度 | 512 维（中文优化） | 384 维 | 768-1536 维 |
+| 向量维度 | 768 维（中文优化，8192 token context） | 384 维 | 768-1536 维 |
 | 混合搜索 | 向量 + BM25 | 仅语义搜索 | 有（但要钱） |
 | 搜索速度 | 12-425ms | 100-500ms | 50-200ms + 网络延迟 |
 | 可视化 | D3.js 力导向图 | 无 | 需额外付费 |
@@ -102,7 +102,7 @@ flowchart TD
 电脑不认识文字，但认识数字。通过 Embedding 模型，每个词/句子都被映射到一个高维空间中的一个点：
 
 ```python
-"开心" → [0.25, -0.34, 0.56, ...]   # 512 维向量
+"开心" → [0.25, -0.34, 0.56, ...]   # 768 维向量
 "愉快" → [0.23, -0.33, 0.55, ...]   # 和"开心"很接近
 "快乐" → [0.26, -0.35, 0.57, ...]   # 和"开心"很接近
 "悲伤" → [-0.80, 0.45, -0.23, ...]  # 和"开心"差很远
@@ -174,23 +174,24 @@ final_score = vector_score × 0.6 + bm25_score × 0.4
 
 同时，系统有**智能降级机制**：当向量服务（Ollama）不可用时，自动回退到纯 BM25 全文搜索，确保服务永远可用。
 
-#### 5. bge-small-zh-v1.5 — 中文向量模型
+#### 5. jina-embeddings-v2-base-zh — 中文向量模型
 
-SummerMemory 使用的 Embedding 模型是 [BAAI/bge-small-zh-v1.5](https://huggingface.co/BAAI/bge-small-zh-v1.5)，这个名字拆开看：
+SummerMemory 使用的 Embedding 模型是 [jina-embeddings-v2-base-zh](https://huggingface.co/jinaai/jina-embeddings-v2-base-zh)，这个名字拆开看：
 
 | 部分 | 含义 |
 |:---|:---|
-| **BAAI** | 北京智源人工智能研究院（开发机构） |
-| **bge** | BAAI General Embedding（通用向量模型） |
-| **small** | 小模型，速度快，资源占用少 |
+| **Jina AI** | 开发模型的公司 |
+| **embeddings** | 把文字变成向量的模型类型 |
+| **v2** | 第二代模型 |
+| **base** | 基础版本，平衡精度和性能 |
 | **zh** | **专门针对中文优化** |
-| **v1.5** | 版本号 |
 
 **为什么选它？**
 - 中文专优化：中文语义理解效果远超通用英文模型
-- CPU 就能跑：小模型，不需要 GPU，普通服务器即可
+- 8192 token context：支持长文本不截断
+- CPU 就能跑：Q5_K_M 量化后仅 116MB，不需要 GPU，普通服务器即可
+- 768 维向量：更高精度
 - 开源免费：通过 Ollama 本地运行，零 API 费用
-- 512 维向量：在速度和精度之间取得平衡
 
 ---
 
@@ -211,7 +212,7 @@ SummerMemory 使用的 Embedding 模型是 [BAAI/bge-small-zh-v1.5](https://hugg
 
 **第二步：向量化（Embedding）**
 
-每个片段通过 Ollama 生成 512 维向量：
+每个片段通过 Ollama 生成 768 维向量：
 
 ```python
 "苹果" → [0.12, -0.34, 0.56, ...]  # 水果空间
@@ -245,7 +246,7 @@ jieba 对每个片段进行分词，存入 PostgreSQL 全文索引：
 
 **第二步：向量搜索**
 
-在 512 维向量空间中搜索最近邻：
+在 768 维向量空间中搜索最近邻：
 
 ```
 "苹果" 的向量 [0.12, -0.34, 0.56, ...] 和 "水果" 距离很近
@@ -296,7 +297,7 @@ flowchart TB
         D3["关系数据"]
     end
 
-    subgraph Ollama["Ollama — bge-small-zh-v1.5 :11434"]
+    subgraph Ollama["Ollama — jina-embeddings-v2-base-zh :11434"]
         O1["Embedding 推理"]
         O2["中文优化模型"]
         O3["CPU 即可运行"]
@@ -348,15 +349,15 @@ SummerMemory 内置了**知识图谱可视化**功能，把所有记忆用一张
 
 ## 性能数据
 
-基于真实使用场景的测试数据（77 个记忆文件，193 个 chunks）：
+基于真实使用场景的测试数据（80 个记忆文件，768 个 chunks）：
 
 | 指标 | 数值 | 说明 |
 |:---|:---|:---|
-| 总文件数 | 77 个 | 记忆文件数量 |
-| 总 chunks | 193 个 | 分块后的记忆片段 |
+| 总文件数 | 80 个 | 记忆文件数量 |
+| 总 chunks | 768 个 | 分块后的记忆片段 |
 | 搜索速度 | **23~36ms** | 平均 ~30ms，毫秒级响应 |
-| 向量维度 | 512 维 | bge-small-zh-v1.5 |
-| 索引速度 | 236ms | 77 个文件增量索引 |
+| 向量维度 | 768 维 | jina-embeddings-v2-base-zh |
+| 索引速度 | 236ms | 80 个文件增量索引 |
 | **总成本** | **¥0** | **纯本地，零费用** |
 
 > 搜索延迟 ~30ms，比网络请求到商业 API 的延迟还低！
@@ -374,7 +375,7 @@ SummerMemory 内置了**知识图谱可视化**功能，把所有记忆用一张
 | 数据隐私 | 零泄露风险 | 本地存储 | 数据上传第三方 |
 | 全文搜索 | BM25 + jieba | 不支持 | 有 |
 | 中文分词 | jieba 深度优化 | 无 | 通用分词 |
-| 向量维度 | 512 维 | 384 维 | 768-1536 维 |
+| 向量维度 | 768 维 | 384 维 | 768-1536 维 |
 | 混合搜索 | 向量 + BM25 融合 | 仅语义搜索 | 有（付费功能） |
 | 搜索速度 | 12-425ms | 100-500ms | 50-200ms + 网络延迟 |
 | 图谱可视化 | D3.js 力导向图 | 无 | 需额外付费 |
@@ -412,7 +413,7 @@ cd backend
 docker compose up -d
 
 # 3. 等待 Ollama 启动完成后，拉取向量模型（首次需要下载 ~100MB）
-docker exec summer-memory-ollama ollama pull quentinz/bge-small-zh-v1.5
+docker exec summer-memory-ollama ollama pull jina-embeddings-v2-base-zh
 
 # 4. （可选）启动前端可视化界面
 cd ../frontend
@@ -431,7 +432,7 @@ npm run dev
 | `DB_USER` | `postgres` | 数据库用户 |
 | `DB_PASSWORD` | `summer2026` | 数据库密码 |
 | `OLLAMA_BASE_URL` | `http://ollama:11434` | Ollama 服务地址 |
-| `OLLAMA_MODEL` | `quentinz/bge-small-zh-v1.5` | 向量模型名称 |
+| `OLLAMA_MODEL` | `jina-embeddings-v2-base-zh` | 向量模型名称 |
 
 > 生产环境请务必修改 `DB_PASSWORD`！
 
@@ -555,10 +556,10 @@ curl "http://localhost:11435/stats"
 
 ```json
 {
-  "total_files": 54,
-  "total_chunks": 270,
-  "total_memories": 270,
-  "unique_files": 54,
+  "total_files": 80,
+  "total_chunks": 768,
+  "total_memories": 768,
+  "unique_files": 80,
   "last_updated": "2026-06-09T15:30:00",
   "directories": {
     "memory": 150,
@@ -633,7 +634,7 @@ cp -r skill/ ~/.openclaw/workspace/skills/summer-memory/
 |:---|:---|:---|
 | 后端 | Python 3.10 + http.server | 轻量 HTTP API 服务 |
 | 数据库 | PostgreSQL 15+ + pgvector | 向量存储 + 关系数据 + 全文索引 |
-| 向量模型 | Ollama (bge-small-zh-v1.5) | 本地中文语义向量（512 维） |
+| 向量模型 | Ollama (jina-embeddings-v2-base-zh) | 本地中文语义向量（768 维，8192 token context） |
 | 中文分词 | jieba | 中文全文检索分词 |
 | 混合搜索 | pgvector 余弦相似度 + TSVECTOR BM25 | 双引擎融合搜索 |
 | 前端 | Vue 3 + Vite | 知识图谱可视化界面 |
