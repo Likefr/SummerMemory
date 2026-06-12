@@ -348,16 +348,17 @@ class MemorySystem:
             self.conn.commit()
         except:
             pass
-        # 向所有 WebSocket 客户端广播 activity 事件
-        try:
-            ws_manager.broadcast({
-                "type": "activity",
-                "action": action,
-                "path": path,
-                "query": query,
-            })
-        except Exception:
-            pass
+        # 向所有 WebSocket 客户端广播 activity 事件（过滤健康检查）
+        if query != 'test':
+            try:
+                ws_manager.broadcast({
+                    "type": "activity",
+                    "action": action,
+                    "path": path,
+                    "query": query,
+                })
+            except Exception:
+                pass
 
     def search(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
         """混合搜索：先尝试向量搜索，失败则回退到全文搜索"""
@@ -694,7 +695,7 @@ class MemoryHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({
                 'version': version,
-                'frontend': 'v260608.1920'
+                'frontend': 'v260612.0855'
             }).encode())
 
         elif path == '/timeline':
