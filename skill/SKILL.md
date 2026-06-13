@@ -147,3 +147,51 @@ bash scripts/install.sh
 4. **路径统一**：使用相对路径（`memory/xxx`），避免绝对路径导致重复索引
 5. **中文优化**：使用 jieba 分词 + BM25，中文搜索效果好于纯 tsvector
 6. **幂等索引**：基于文件 hash 去重，重复索引不会产生重复记录
+
+## OpenClaw 集成配置
+
+### 强制使用 SummerMemory（重要）
+
+为了让 OpenClaw **默认使用 SummerMemory 而不是内置记忆系统**，需要在 OpenClaw 配置中做两件事：
+
+#### 1. 禁用内置记忆工具
+
+在 `openclaw.json` 的 `tools` 配置块中添加 `deny` 列表：
+
+```json
+"tools": {
+  "profile": "full",
+  "deny": ["memory_search", "memory_get"],
+  "exec": {
+    "security": "full",
+    "ask": "off",
+    "host": "auto"
+  }
+}
+```
+
+#### 2. 注入 MEMORY.md 到每个新对话
+
+将 `contextInjection` 设为 `"always"`，确保 MEMORY.md 的红线规则在每个新对话的系统提示中注入：
+
+```json
+"agents": {
+  "defaults": {
+    "contextInjection": "always"
+  }
+}
+```
+
+#### 为什么这样做
+
+- **问题**：OpenClaw 自带 `memory_search` / `memory_get`，模型默认优先使用内置工具，导致不经过 SummerMemory 直接读文件
+- **解决**：`deny` 从工具列表里移除这两个工具；`contextInjection` 让 MEMORY.md 的红线规则在每个新对话里都出现
+- **效果**：模型第一眼就看到"用 SummerMemory"，且内置工具根本调不了，只能走 `exec + memory_system.py` 或 HTTP API
+
+### 重启生效
+
+修改 `openclaw.json` 后需要重启：
+
+```bash
+systemctl restart openclaw
+```
