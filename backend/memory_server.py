@@ -521,22 +521,47 @@ class MemorySystem:
                             'weight': 0.5
                         })
 
-            # 基于内容重叠的链接（逐 chunk 比较取最高相似度）
+            # 基于内容重叠的链接（一次查出所有 embedding，内存算距离）
             with self.conn.cursor() as cur2:
-                for i, path1 in enumerate(path_list):
-                    for path2 in path_list[i+1:]:
-                        cur2.execute("""
-                            SELECT MAX(1 - (m1.embedding <=> m2.embedding)) AS similarity
-                            FROM memories m1, memories m2
-                            WHERE m1.path = %s AND m2.path = %s
-                            AND m1.embedding IS NOT NULL AND m2.embedding IS NOT NULL
-                        """, (path1, path2))
-                        row = cur2.fetchone()
-                        if row and row[0] is not None and row[0] > 0.8:
+                cur2.execute("""
+                    SELECT path, embedding
+                    FROM memories
+                    WHERE embedding IS NOT NULL
+                """)
+                import numpy as np
+                # 按 path 分组解析 embedding 字符串，计算质心
+                path_embs = {}  # path -> list of np.array
+                for row in cur2.fetchall():
+                    path = row[0]
+                    emb_str = row[1]
+                    if not emb_str:
+                        continue
+                    emb = np.array([float(x) for x in emb_str.strip('[]').split(',')])
+                    path_embs.setdefault(path, []).append(emb)
+
+                centroids = {}  # path -> normalized centroid
+                for path, embs in path_embs.items():
+                    arr = np.array(embs)
+                    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+                    norms[norms == 0] = 1
+                    arr = arr / norms
+                    centroid = arr.mean(axis=0)
+                    norm = np.linalg.norm(centroid)
+                    if norm > 0:
+                        centroid = centroid / norm
+                    centroids[path] = centroid
+
+                # 内存中 O(n²) 算余弦相似度（向量点积）
+                path_list_emb = [p for p in path_list if p in centroids]
+                for i, path1 in enumerate(path_list_emb):
+                    c1 = centroids[path1]
+                    for path2 in path_list_emb[i+1:]:
+                        sim = float(np.dot(c1, centroids[path2]))
+                        if sim > 0.8:
                             links.append({
                                 'source': path1,
                                 'target': path2,
-                                'weight': float(row[0])
+                                'weight': sim
                             })
 
         return {
