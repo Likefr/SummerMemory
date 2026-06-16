@@ -449,7 +449,7 @@ class MemorySystem:
             'directories': dirs
         }
 
-    def get_graph_data(self) -> Dict[str, Any]:
+    def get_graph_data(self, threshold=0.85) -> Dict[str, Any]:
         """获取关系图数据"""
         with self.conn.cursor() as cur:
             # 按文件 path 分组，统计实际 chunk 数
@@ -495,6 +495,7 @@ class MemorySystem:
                     'chunks': chunks,
                     'fileSize': size,
                     'label': filename,
+                    'last_updated': row[2].isoformat() if row[2] else None,
                 }
                 file_nodes.add(path)
                 nodes.append(node)
@@ -508,18 +509,11 @@ class MemorySystem:
                 p1 = Path(path1)
                 for path2 in path_list[i+1:]:
                     p2 = Path(path2)
-                    if p1.parent == p2.parent:
-                        links.append({
-                            'source': path1,
-                            'target': path2,
-                            'weight': 0.3
-                        })
-                    elif p1.stem[:10] == p2.stem[:10]:
-                        links.append({
-                            'source': path1,
-                            'target': path2,
-                            'weight': 0.5
-                        })
+                    # 注释掉目录/文件名硬关联，只保留 embedding 语义链接
+                    # if p1.parent == p2.parent:
+                    #     links.append({'source': path1, 'target': path2, 'weight': 0.3})
+                    # elif p1.stem[:10] == p2.stem[:10]:
+                    #     links.append({'source': path1, 'target': path2, 'weight': 0.5})
 
             # 基于内容重叠的链接（一次查出所有 embedding，内存算距离）
             with self.conn.cursor() as cur2:
@@ -557,7 +551,7 @@ class MemorySystem:
                     c1 = centroids[path1]
                     for path2 in path_list_emb[i+1:]:
                         sim = float(np.dot(c1, centroids[path2]))
-                        if sim > 0.8:
+                        if sim > threshold:
                             links.append({
                                 'source': path1,
                                 'target': path2,
@@ -662,6 +656,7 @@ class MemoryHandler(BaseHTTPRequestHandler):
         memory.conn.rollback()  # 每次请求前清理可能失败的 transaction
         parsed_path = urllib.parse.urlparse(self.path)
         path = parsed_path.path
+        parsed_query = urllib.parse.parse_qs(parsed_path.query)
         params = urllib.parse.parse_qs(parsed_path.query)
 
         # 公开端点
@@ -707,7 +702,8 @@ class MemoryHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(result, ensure_ascii=False).encode())
 
         elif path == '/graph-data':
-            result = memory.get_graph_data()
+            threshold = float(parsed_query.get('threshold', ['0.85'])[0])
+            result = memory.get_graph_data(threshold)
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')

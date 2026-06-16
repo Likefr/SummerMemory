@@ -8,8 +8,8 @@ const API_BASE = import.meta.env.DEV
   ? '/api/memory' 
   : 'https://ai.likefr.com/graphApi'
 
-export async function fetchGraphData() {
-  const response = await fetch(`${API_BASE}/graph-data`)
+export async function fetchGraphData(threshold = 0.85) {
+  const response = await fetch(`${API_BASE}/graph-data?threshold=${threshold}`)
   if (!response.ok) throw new Error('Failed to fetch graph data')
   return response.json()
 }

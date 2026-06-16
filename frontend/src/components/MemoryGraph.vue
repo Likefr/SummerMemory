@@ -23,6 +23,10 @@
         <span class="stat stat-time">{{ searchTime > 0 ? searchTime + 'ms' : '' }}</span>
       </div>
       <div class="header-right">
+        <div class="online-badge" v-if="showOnline && onlineCount > 0" :title="onlineCount + ' online'">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          <span>{{ onlineCount }}</span>
+        </div>
         <button class="header-btn theme-toggle" @click="toggleTheme" :title="isDark ? 'Light mode' : 'Dark mode'">
           <svg v-if="isDark" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
@@ -211,6 +215,11 @@
               <div class="config-item">
                 <label>{{ t('showLinks') }}</label>
                 <input type="checkbox" v-model="showLinks" class="config-switch" />
+              </div>
+              <div class="config-item">
+                <label>相似度阈值</label>
+                <input type="range" v-model.number="similarityThreshold" min="0.60" max="1.0" step="0.01" class="config-range" />
+                <span class="range-value">{{ similarityThreshold.toFixed(2) }} ({{ filteredLinks.length }} 条)</span>
               </div>
               <div class="config-item">
                 <label>{{ t('linkWidth') }}</label>
@@ -475,6 +484,7 @@ const sizeRangeMin = ref(2)
 const sizeRangeMax = ref(20)
 const showLinks = ref(true)
 const linkWidth = ref(1)
+const similarityThreshold = ref(0.85)
 const linkDefaultColor = ref('rgba(100, 180, 255, 0.3)')
 const linkColorPresets = [
   'rgba(100, 180, 255, 0.3)',
@@ -511,17 +521,19 @@ const autoRefresh = ref(false)
 const refreshInterval = ref(1000)
 const searching = ref(false)
 
-// WebSocket & timeline
+// WebSocket & timeline & online count
 let refreshTimer = null
 let ws = null
 let wsReconnectTimer = null
+const onlineCount = ref(0)
+const showOnline = ref(false)
 const timelineExpanded = ref(false)
 const timelineData = ref([])
 const selectedDate = ref('')
 const selectedFiles = ref([])
 const maxTimelineCount = computed(() => Math.max(...timelineData.value.map(t => t.count), 1))
 let searchTimer = null
-const currentVersion = ref('v260611.2351')
+const currentVersion = ref('')
 let _previewFitTimer = null
 
 // Colors — 按路径前缀分类
@@ -547,7 +559,13 @@ function getColor(node) {
 
 // Computed
 const fileNodes = computed(() => {
-  return nodes.value.filter(n => n.type === 'file')
+  return nodes.value
+    .filter(n => n.type === 'file')
+    .sort((a, b) => (b.last_updated || '').localeCompare(a.last_updated || ''))
+})
+
+const filteredLinks = computed(() => {
+  return links.value.filter(l => l.weight >= similarityThreshold.value)
 })
 
 // ── 构建 Cosmograph 数据格式 ──
@@ -620,7 +638,7 @@ async function loadData() {
   const startTime = performance.now()
   try {
     const [graphData, statsData] = await Promise.all([
-      fetchGraphData(),
+      fetchGraphData(similarityThreshold.value),
       getStats()
     ])
     searchTime.value = Math.round(performance.now() - startTime)
@@ -669,7 +687,7 @@ function initGraph() {
       pointIndexBy: 'index',
       pointLabelBy: 'label',
       pointColorBy: 'color',
-      links: buildLinks(links.value, showLinks.value),
+      links: buildLinks(filteredLinks.value, showLinks.value),
       linkSourceBy: 'source',
       linkTargetBy: 'target',
       linkSourceIndexBy: 'sourceIndex',
@@ -781,7 +799,7 @@ function initGraph() {
       pointIndexBy: 'index',
       pointLabelBy: 'label',
       pointColorBy: 'color',
-      links: buildLinks(links.value, showLinks.value),
+      links: buildLinks(filteredLinks.value, showLinks.value),
       linkSourceBy: 'source',
       linkTargetBy: 'target',
       linkSourceIndexBy: 'sourceIndex',
@@ -859,8 +877,25 @@ async function pulseNode(nodeId) {
 // ── 增量更新图谱 ──
 function updateGraphData() {
   if (!graph.value) return
-  const pts = buildPoints(nodes.value)
-  updateGraphConfig({ points: pts })
+  const container = graphContainer.value
+  container.style.transition = 'opacity 0.2s ease'
+  container.style.opacity = '0.3'
+  setTimeout(() => {
+    const pts = buildPoints(nodes.value)
+    const lnks = buildLinks(filteredLinks.value, showLinks.value)
+    try {
+      updateGraphConfig({ points: pts, links: lnks })
+    } catch (e) {
+      console.warn('[Graph] setConfig failed, rebuilding:', e)
+      rebuildGraph()
+      return
+    }
+    container.style.opacity = '1'
+    // setConfig 是异步的，延迟启动模拟确保它完成
+    setTimeout(() => {
+      try { graph.value.start(1) } catch (e) {}
+    }, 300)
+  }, 200)
 }
 
 // ── 搜索 ──
@@ -921,8 +956,12 @@ function refreshData() {
 // 销毁重建 Cosmograph（避免 removeChild bug）
 function rebuildGraph() {
   if (graph.value) {
-    graph.value.destroy()
+    try { graph.value.destroy() } catch (e) { /* ignore */ }
     graph.value = null
+  }
+  // 清空容器释放 WASM 内存
+  if (graphContainer.value) {
+    graphContainer.value.innerHTML = ''
   }
   nodes.value = [...nodes.value]
   initGraph()
@@ -980,7 +1019,7 @@ function applyFilter() {
     return (n.chunks || 0) >= mc && (connMap[String(n.id)] || 0) >= mconn
   })
   const filteredIds = new Set(filteredNodes.map(n => String(n.id)))
-  const filteredLinks = links.value.filter(l => filteredIds.has(String(l.source)) && filteredIds.has(String(l.target)))
+  const filteredLinks = filteredLinks.value.filter(l => filteredIds.has(String(l.source)) && filteredIds.has(String(l.target)))
 
   if (graph.value) {
     try {
@@ -991,7 +1030,7 @@ function applyFilter() {
 
 function resetFilter() {
   if (graph.value) {
-    updateGraphConfig({ points: buildPoints(nodes.value), links: buildLinks(links.value, showLinks.value) })
+    updateGraphConfig({ points: buildPoints(nodes.value), links: buildLinks(filteredLinks.value, showLinks.value) })
   }
 }
 
@@ -1016,6 +1055,12 @@ watch([sizeRangeMin, sizeRangeMax], () => {
 // 外观 - 连线开关
 watch(showLinks, () => {
   updateGraphConfig({ linkDefaultWidth: showLinks.value ? linkWidth.value : 0 })
+})
+
+let _thresholdTimer = null
+watch(similarityThreshold, () => {
+  clearTimeout(_thresholdTimer)
+  _thresholdTimer = setTimeout(() => loadData(), 300)
 })
 
 watch([linkWidth, linkDefaultColor], () => {
@@ -1047,6 +1092,10 @@ watch([simRepulsion, simGravity, simFriction, simDecay, simLinkDistance], () => 
 
 // ── Mouse move for tooltip ──
 function handleKeyDown(e) {
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'o') {
+    e.preventDefault()
+    showOnline.value = !showOnline.value
+  }
   if (e.ctrlKey && e.key === 'x') {
     e.preventDefault()
     rightCollapsed.value = !rightCollapsed.value
@@ -1121,7 +1170,9 @@ onMounted(() => {
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data)
-        if (data.type === 'activity') {
+        if (data.type === 'online_count') {
+          onlineCount.value = data.count
+        } else if (data.type === 'activity') {
           const path = data.path
           const matchNode = nodes.value.find(n => {
             const raw = n._raw || n
@@ -1316,6 +1367,23 @@ onUnmounted(() => {
   display: flex;
   gap: 4px;
   align-items: center;
+}
+
+/* ===== Online Badge ===== */
+.online-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border-radius: 8px;
+ font-size: 11px;
+  font-weight: 600;
+  color: var(--green);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+}
+.online-badge svg {
+  opacity: 0.7;
 }
 
 /* ===== Buttons ===== */
