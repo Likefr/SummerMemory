@@ -326,7 +326,7 @@ flowchart TB
 | **写入** | 文本 → jieba 分词 + Ollama 向量化 → PostgreSQL（pgvector + TSVECTOR）存储 |
 | **搜索** | 查询文本 → 向量化 → 向量余弦相似度 + BM25 全文检索 → 混合排序 |
 | **图谱** | 记忆路径关系 → 力导向图 / Cosmograph GPU 渲染可视化 |
-| **OpenClaw** | Skill → CLI 命令行工具 → 无缝接入 AI 助手工作流 |
+| **OpenClaw** | CLI 命令行工具 → 无缝接入 AI 助手工作流 |
 
 ---
 
@@ -471,45 +471,22 @@ SummerMemory/
 │   ├── vite.config.js          ← Vite 构建配置
 │   ├── package.json
 │   └── .gitignore
-│
-└── skill/                      ← OpenClaw Skill 集成
-    ├── SKILL.md                ← Skill 定义文件
-    ├── scripts/
-    │   ├── install.sh          ← 一键安装脚本
-    │   └── init-db.sql         ← 数据库初始化 SQL
-    ├── references/
-    │   ├── api-docs.md         ← 完整 API 文档
-    │   └── architecture.md     ← 系统架构详解
-    └── templates/
-        ├── docker-compose.yml  ← 部署模板
-        └── systemd.service     ← systemd 服务模板
+
 ```
 
 ---
 
-## API 文档
+## 使用方式
 
-后端服务运行在 `http://localhost:11435`，所有接口均支持 CORS。
+SummerMemory 提供 CLI 命令行工具 `memory_system.py`，所有操作通过命令行完成。
 
-### 搜索与查询
-
-#### `GET /search` — 混合搜索
-
-核心接口，同时使用向量搜索和 BM25 全文搜索。
+### 搜索记忆
 
 ```bash
-# 搜索"水果"相关的记忆，返回前 5 条
-curl "http://localhost:11435/search?query=水果&limit=5"
+python3 memory_system.py search "水果"
 ```
 
-**参数：**
-
-| 参数 | 类型 | 默认值 | 说明 |
-|:---|:---|:---|:---|
-| `query` | string | 必填 | 搜索查询文本 |
-| `limit` | int | 5 | 返回结果数量（最大 20） |
-
-**响应示例：**
+返回混合搜索结果（向量 60% + BM25 40%）：
 
 ```json
 [
@@ -522,37 +499,33 @@ curl "http://localhost:11435/search?query=水果&limit=5"
 ]
 ```
 
-### 数据管理
+### 索引记忆
 
-#### `GET /index` — 获取记忆索引
-
-返回所有记忆条目，是图谱可视化的数据源。
+写入或更新记忆后，执行索引让新内容被搜索引擎收录：
 
 ```bash
-curl "http://localhost:11435/index"
+python3 memory_system.py index
 ```
 
-#### `POST /index` — 写入/更新记忆（仅限本地）
+返回索引结果：
 
-触发全工作区的记忆索引更新，仅允许 `127.0.0.1` 访问。
+```json
+{
+  "indexed": 2,
+  "updated": 1,
+  "unchanged": 10,
+  "failed": 0,
+  "details": [...]
+}
+```
+
+### 查看统计
 
 ```bash
-curl -X POST "http://localhost:11435/index"
+python3 memory_system.py stats
 ```
 
-#### `DELETE /memory?id=<id>` — 删除记忆
-
-删除指定 ID 的记忆条目。
-
-### 统计与分析
-
-#### `GET /stats` — 系统统计
-
-```bash
-curl "http://localhost:11435/stats"
-```
-
-**响应示例：**
+返回系统统计信息：
 
 ```json
 {
@@ -562,69 +535,18 @@ curl "http://localhost:11435/stats"
   "unique_files": 80,
   "last_updated": "2026-06-09T15:30:00",
   "directories": {
-    "memory": 150,
-    "skills": 80,
-    "tools": 40
+    "memory": 150
   }
 }
 ```
 
-#### `GET /graph-data` — 图谱数据
-
-返回知识图谱的节点和边数据，供前端可视化使用。
+### 用法总结
 
 ```bash
-curl "http://localhost:11435/graph-data"
+python3 memory_system.py search <关键词>    # 搜索记忆
+python3 memory_system.py index              # 索引/更新记忆
+python3 memory_system.py stats              # 查看统计
 ```
-
-#### `GET /timeline` — 时间轴数据
-
-按天统计记忆数量变化。
-
-```bash
-curl "http://localhost:11435/timeline"
-```
-
-#### `GET /activity` — 活动日志
-
-返回最近的搜索、索引等操作记录。
-
-```bash
-curl "http://localhost:11435/activity?limit=10"
-```
-
-**参数：**
-
-| 参数 | 类型 | 默认值 | 说明 |
-|:---|:---|:---|:---|
-| `limit` | int | 10 | 返回条目数（最大 50） |
-
-#### `GET /version` — 版本信息
-
-返回数据版本时间戳和前端版本号。
-
-```bash
-curl "http://localhost:11435/version"
-```
-
-> 更详细的 API 文档请参考 [skill/references/api-docs.md](skill/references/api-docs.md)
-
----
-
-## OpenClaw 集成
-
-SummerMemory 提供了 **OpenClaw Skill**，可以将记忆系统无缝集成到 AI 助手工作流中：
-
-```bash
-# 将 Skill 目录复制到 OpenClaw 工作区
-cp -r skill/ ~/.openclaw/workspace/skills/summer-memory/
-```
-
-安装后，AI 助手可以通过 Skill 定义的命令行工具进行：
-- **记忆存储**：自动索引工作区文件
-- **记忆搜索**：混合搜索相关记忆
-- **统计分析**：查看记忆系统状态
-- **图谱浏览**：探索记忆关联关系
 
 ---
 
@@ -642,7 +564,7 @@ cp -r skill/ ~/.openclaw/workspace/skills/summer-memory/
 | 国际化 | Vue I18n | 中英文界面切换 |
 | 部署 | Docker Compose | 一键启动全部服务 |
 | 进程管理 | systemd | 开机自启、故障自愈 |
-| AI 集成 | OpenClaw Skill | 命令行工具 + 自动化工作流 |
+| AI 集成 | CLI 命令行工具 | 命令行调用 + 自动化工作流 |
 
 ---
 
