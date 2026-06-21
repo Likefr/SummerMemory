@@ -112,6 +112,9 @@ class MemorySystem:
     def __init__(self):
         self.conn = self._get_connection()
         self._ensure_tables()
+        # 预加载 embedding 缓存（启动时解析一次，避免每次请求重复解析字符串）
+        self._emb_cache = {}  # path -> {'centroid': np.array, 'updated_at': datetime, 'meta': dict, 'chunks': int}
+        self._preload_embedding_cache()
 
     def _get_connection(self):
         """创建新的数据库连接"""
@@ -194,6 +197,96 @@ class MemorySystem:
                 );
             """)
             self.conn.commit()
+
+    def _preload_embedding_cache(self):
+        """启动时预加载所有 embedding 到内存，直接解析为 numpy 数组"""
+        print("[Cache] 预加载 embedding...")
+        t0 = time.time()
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT path, metadata, embedding, updated_at
+                FROM memories
+                WHERE embedding IS NOT NULL
+                ORDER BY path, chunk_index
+            """)
+            path_embs = {}
+            path_meta = {}
+            path_updated = {}
+            path_chunks = {}
+            for row in cur.fetchall():
+                path, meta, emb_str, updated_at = row
+                if path not in path_meta:
+                    path_meta[path] = meta
+                    path_updated[path] = updated_at
+                    path_chunks[path] = 0
+                    path_embs[path] = []
+                else:
+                    if updated_at and (path_updated[path] is None or updated_at > path_updated[path]):
+                        path_updated[path] = updated_at
+                if emb_str:
+                    # 直接解析为 numpy 数组，避免重复解析
+                    arr = np.array([float(x) for x in emb_str.strip('[]').split(',')])
+                    path_embs[path].append(arr)
+                    path_chunks[path] += 1
+
+            # 计算质心并存入缓存
+            for path, embs in path_embs.items():
+                arr = np.array(embs)
+                norms = np.linalg.norm(arr, axis=1, keepdims=True)
+                norms[norms == 0] = 1
+                arr_normalized = arr / norms
+                centroid = arr_normalized.mean(axis=0)
+                norm = np.linalg.norm(centroid)
+                if norm > 0:
+                    centroid = centroid / norm
+                self._emb_cache[path] = {
+                    'centroid': centroid,
+                    'updated_at': path_updated.get(path),
+                    'meta': path_meta.get(path),
+                    'chunks': path_chunks[path],
+                }
+        print(f"[Cache] 预加载完成: {len(self._emb_cache)} 个文件, 耗时 {(time.time()-t0)*1000:.0f}ms")
+
+    def _refresh_embedding_cache(self, path: str):
+        """刷新单个 path 的 embedding 缓存（index 后调用）"""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT metadata, embedding, updated_at
+                FROM memories
+                WHERE path = %s AND embedding IS NOT NULL
+                ORDER BY chunk_index
+            """, (path,))
+            rows = cur.fetchall()
+            if not rows:
+                self._emb_cache.pop(path, None)
+                return
+            embs = []
+            meta = None
+            updated = None
+            for row in rows:
+                meta, emb_str, updated_at = row
+                if meta is None:
+                    meta = {}
+                if emb_str:
+                    arr = np.array([float(x) for x in emb_str.strip('[]').split(',')])
+                    embs.append(arr)
+                if updated_at:
+                    updated = updated_at
+            if embs:
+                arr = np.array(embs)
+                norms = np.linalg.norm(arr, axis=1, keepdims=True)
+                norms[norms == 0] = 1
+                arr_normalized = arr / norms
+                centroid = arr_normalized.mean(axis=0)
+                norm = np.linalg.norm(centroid)
+                if norm > 0:
+                    centroid = centroid / norm
+                self._emb_cache[path] = {
+                    'centroid': centroid,
+                    'updated_at': updated,
+                    'meta': meta,
+                    'chunks': len(embs),
+                }
 
     def get_embedding(self, text: str) -> Optional[List[float]]:
         """调用 Ollama 获取文本嵌入向量，失败返回 None"""
@@ -309,8 +402,8 @@ class MemorySystem:
                 status = 'updated'
 
         self.conn.commit()
-        # 刷新 graph 缓存
-        self._load_graph_cache()
+        # 刷新 embedding 缓存
+        self._refresh_embedding_cache(rel_path)
         return {'path': str(path), 'status': status, 'chunks': len(chunks)}
 
     def index_workspace(self) -> Dict[str, Any]:
@@ -338,8 +431,8 @@ class MemorySystem:
                 results['details'].append(result)
 
         self.conn.commit()
-        # 刷新 graph 缓存
-        self._load_graph_cache()
+        # 重建 embedding 缓存
+        self._preload_embedding_cache()
         # 记录活动
         self._log_activity('index_workspace', 'memory/', None)
         return results
@@ -454,84 +547,15 @@ class MemorySystem:
             'directories': dirs
         }
 
-    def _load_graph_cache(self):
-        """一次性加载所有 embedding 到内存缓存（后台预热，get_graph_data 本身不再查 DB）"""
-        global _graph_cache
-        try:
-            self._ensure_connection()
-            with self.conn.cursor() as cur:
-                cur.execute("SELECT path, embedding FROM memories WHERE embedding IS NOT NULL")
-                path_embs = {}
-                for row in cur.fetchall():
-                    path, emb_str = row
-                    if not emb_str:
-                        continue
-                    emb = np.array([float(x) for x in emb_str.strip('[]').split(',')])
-                    path_embs.setdefault(path, []).append(emb)
-
-                centroids = {}
-                for path, embs in path_embs.items():
-                    arr = np.array(embs)
-                    norms = np.linalg.norm(arr, axis=1, keepdims=True)
-                    norms[norms == 0] = 1
-                    arr = arr / norms
-                    centroid = arr.mean(axis=0)
-                    norm = np.linalg.norm(centroid)
-                    if norm > 0:
-                        centroid = centroid / norm
-                    centroids[path] = centroid
-
-                _graph_cache = {'centroids': centroids, 'updated_at': time.time()}
-                print(f"Graph cache: {len(centroids)} files")
-        except Exception as e:
-            print(f"Graph cache load error: {e}")
-
     def get_graph_data(self, threshold=0.85) -> Dict[str, Any]:
-        """获取关系图数据
-        
-        一次查询所有数据，Python 端聚合：
-        1. 按 path 分组统计 chunk_count / last_updated（节点基本信息）
-        2. 同时按 path 收集所有 embedding，在 Python 端算质心
-        3. Python 端 O(n²) 相似度计算链接
-        """
-        self._ensure_connection()
-        with self.conn.cursor() as cur:
-            # 单次查询：path + metadata + embedding
-            cur.execute("""
-                SELECT path, metadata, embedding, updated_at
-                FROM memories
-                WHERE embedding IS NOT NULL
-                ORDER BY path, chunk_index
-            """)
-
-            # Python 端按 path 分组聚合
-            path_meta = {}       # path -> metadata（取第一个）
-            path_embs = {}        # path -> [np.array, ...]
-            path_chunk_count = {} # path -> chunk 数
-            path_updated = {}    # path -> updated_at（取最新的）
-
-            for row in cur.fetchall():
-                path, meta, emb_str, updated_at = row
-                if path not in path_meta:
-                    path_meta[path] = meta
-                    path_chunk_count[path] = 0
-                    path_updated[path] = updated_at
-                else:
-                    # 取更新的时间
-                    if updated_at and (path_updated[path] is None or updated_at > path_updated[path]):
-                        path_updated[path] = updated_at
-                if emb_str:
-                    emb = np.array([float(x) for x in emb_str.strip('[]').split(',')])
-                    path_embs.setdefault(path, []).append(emb)
-                    path_chunk_count[path] += 1
-
-        # 节点
+        """获取关系图数据（从预加载的 embedding 缓存读取）"""
+        # 节点（从缓存）
         nodes = []
-        for path in sorted(path_meta.keys()):
-            meta = path_meta[path] or {}
+        for path in sorted(self._emb_cache.keys()):
+            entry = self._emb_cache[path]
+            meta = entry['meta'] or {}
             size = meta.get('size', 0)
-            updated = path_updated.get(path)
-            # 格式：2026-06-20T14:12:25（去掉毫秒）
+            updated = entry['updated_at']
             updated_str = updated.strftime('%Y-%m-%dT%H:%M:%S') if updated else None
             nodes.append({
                 'id': path,
@@ -541,31 +565,18 @@ class MemorySystem:
                 'group': Path(path).parent.name or 'root',
                 'path': path,
                 'size': size,
-                'chunks': path_chunk_count[path],
+                'chunks': entry['chunks'],
                 'fileSize': size,
                 'label': Path(path).name,
                 'last_updated': updated_str,
             })
 
-        # 质心计算
-        centroids = {}
-        for path, embs in path_embs.items():
-            arr = np.array(embs)
-            norms = np.linalg.norm(arr, axis=1, keepdims=True)
-            norms[norms == 0] = 1
-            arr = arr / norms
-            centroid = arr.mean(axis=0)
-            norm = np.linalg.norm(centroid)
-            if norm > 0:
-                centroid = centroid / norm
-            centroids[path] = centroid
-
-        # O(n²) 相似度链接
+        # O(n²) 相似度链接（直接用缓存的质心）
         links = []
-        paths = sorted(centroids.keys())
+        paths = sorted(self._emb_cache.keys())
         for i, p1 in enumerate(paths):
             for p2 in paths[i+1:]:
-                sim = float(np.dot(centroids[p1], centroids[p2]))
+                sim = float(np.dot(self._emb_cache[p1]['centroid'], self._emb_cache[p2]['centroid']))
                 if sim > threshold:
                     links.append({'source': p1, 'target': p2, 'weight': sim})
 
@@ -617,10 +628,6 @@ class WebSocketManager:
 
 
 ws_manager = WebSocketManager()
-
-# ---- Graph 缓存（避免每次从 PG 读 228 条 embedding 字符串并解析）----
-_graph_cache = None   # {'centroids': {path: np.array}, 'version': int, 'updated_at': float}
-_graph_cache_version = 0
 
 
 async def _ws_handler(websocket):
