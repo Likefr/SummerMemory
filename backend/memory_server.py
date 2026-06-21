@@ -21,6 +21,7 @@ import requests
 import psycopg2
 import jieba
 import websockets
+import numpy as np
 
 # 配置
 DB_CONFIG = {
@@ -308,6 +309,8 @@ class MemorySystem:
                 status = 'updated'
 
         self.conn.commit()
+        # 刷新 graph 缓存
+        self._load_graph_cache()
         return {'path': str(path), 'status': status, 'chunks': len(chunks)}
 
     def index_workspace(self) -> Dict[str, Any]:
@@ -335,6 +338,8 @@ class MemorySystem:
                 results['details'].append(result)
 
         self.conn.commit()
+        # 刷新 graph 缓存
+        self._load_graph_cache()
         # 记录活动
         self._log_activity('index_workspace', 'memory/', None)
         return results
@@ -449,91 +454,22 @@ class MemorySystem:
             'directories': dirs
         }
 
-    def get_graph_data(self, threshold=0.85) -> Dict[str, Any]:
-        """获取关系图数据"""
-        with self.conn.cursor() as cur:
-            # 按文件 path 分组，统计实际 chunk 数
-            cur.execute("""
-                SELECT path, COUNT(*) as chunk_count,
-                       MAX(updated_at) as last_updated
-                FROM memories
-                GROUP BY path
-                ORDER BY path
-            """)
-            file_rows = cur.fetchall()
-
-            nodes = []
-            file_nodes = set()
-            # 缓存每个文件的 metadata（取第一个 chunk 的）
-            file_meta = {}
-            cur.execute("""
-                SELECT DISTINCT ON (path) path, metadata
-                FROM memories
-                ORDER BY path, chunk_index
-            """)
-            for row in cur.fetchall():
-                file_meta[row[0]] = row[1] or {}
-
-            for row in file_rows:
-                path = row[0]
-                chunk_count = row[1]
-                filename = Path(path).name
-
-                metadata = file_meta.get(path, {})
-                size = metadata.get('size', 0)
-                # 使用实际 chunk 记录数
-                chunks = chunk_count
-
-                node = {
-                    'id': path,
-                    'name': filename,
-                    'type': 'file',
-                    'val': max(1, min(10, size / 1000)),
-                    'group': Path(path).parent.name or 'root',
-                    'path': path,
-                    'size': size,
-                    'chunks': chunks,
-                    'fileSize': size,
-                    'label': filename,
-                    'last_updated': row[2].isoformat() if row[2] else None,
-                }
-                file_nodes.add(path)
-                nodes.append(node)
-
-            # 构建链接
-            links = []
-            path_list = sorted(file_nodes)
-
-            # 基于目录关系的链接
-            for i, path1 in enumerate(path_list):
-                p1 = Path(path1)
-                for path2 in path_list[i+1:]:
-                    p2 = Path(path2)
-                    # 注释掉目录/文件名硬关联，只保留 embedding 语义链接
-                    # if p1.parent == p2.parent:
-                    #     links.append({'source': path1, 'target': path2, 'weight': 0.3})
-                    # elif p1.stem[:10] == p2.stem[:10]:
-                    #     links.append({'source': path1, 'target': path2, 'weight': 0.5})
-
-            # 基于内容重叠的链接（一次查出所有 embedding，内存算距离）
-            with self.conn.cursor() as cur2:
-                cur2.execute("""
-                    SELECT path, embedding
-                    FROM memories
-                    WHERE embedding IS NOT NULL
-                """)
-                import numpy as np
-                # 按 path 分组解析 embedding 字符串，计算质心
-                path_embs = {}  # path -> list of np.array
-                for row in cur2.fetchall():
-                    path = row[0]
-                    emb_str = row[1]
+    def _load_graph_cache(self):
+        """一次性加载所有 embedding 到内存缓存（后台预热，get_graph_data 本身不再查 DB）"""
+        global _graph_cache
+        try:
+            self._ensure_connection()
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT path, embedding FROM memories WHERE embedding IS NOT NULL")
+                path_embs = {}
+                for row in cur.fetchall():
+                    path, emb_str = row
                     if not emb_str:
                         continue
                     emb = np.array([float(x) for x in emb_str.strip('[]').split(',')])
                     path_embs.setdefault(path, []).append(emb)
 
-                centroids = {}  # path -> normalized centroid
+                centroids = {}
                 for path, embs in path_embs.items():
                     arr = np.array(embs)
                     norms = np.linalg.norm(arr, axis=1, keepdims=True)
@@ -545,23 +481,86 @@ class MemorySystem:
                         centroid = centroid / norm
                     centroids[path] = centroid
 
-                # 内存中 O(n²) 算余弦相似度（向量点积）
-                path_list_emb = [p for p in path_list if p in centroids]
-                for i, path1 in enumerate(path_list_emb):
-                    c1 = centroids[path1]
-                    for path2 in path_list_emb[i+1:]:
-                        sim = float(np.dot(c1, centroids[path2]))
-                        if sim > threshold:
-                            links.append({
-                                'source': path1,
-                                'target': path2,
-                                'weight': sim
-                            })
+                _graph_cache = {'centroids': centroids, 'updated_at': time.time()}
+                print(f"Graph cache: {len(centroids)} files")
+        except Exception as e:
+            print(f"Graph cache load error: {e}")
 
-        return {
-            'nodes': nodes,
-            'links': links
-        }
+    def get_graph_data(self, threshold=0.85) -> Dict[str, Any]:
+        """获取关系图数据
+        
+        一次查询所有数据，Python 端聚合：
+        1. 按 path 分组统计 chunk_count / last_updated（节点基本信息）
+        2. 同时按 path 收集所有 embedding，在 Python 端算质心
+        3. Python 端 O(n²) 相似度计算链接
+        """
+        self._ensure_connection()
+        with self.conn.cursor() as cur:
+            # 单次查询：path + metadata + embedding
+            cur.execute("""
+                SELECT path, metadata, embedding
+                FROM memories
+                WHERE embedding IS NOT NULL
+                ORDER BY path, chunk_index
+            """)
+
+            # Python 端按 path 分组聚合
+            path_meta = {}       # path -> metadata（取第一个）
+            path_embs = {}        # path -> [np.array, ...]
+            path_chunk_count = {} # path -> chunk 数
+
+            for row in cur.fetchall():
+                path, meta, emb_str = row
+                if path not in path_meta:
+                    path_meta[path] = meta
+                    path_chunk_count[path] = 0
+                if emb_str:
+                    emb = np.array([float(x) for x in emb_str.strip('[]').split(',')])
+                    path_embs.setdefault(path, []).append(emb)
+                    path_chunk_count[path] += 1
+
+        # 节点
+        nodes = []
+        for path in sorted(path_meta.keys()):
+            meta = path_meta[path] or {}
+            size = meta.get('size', 0)
+            nodes.append({
+                'id': path,
+                'name': Path(path).name,
+                'type': 'file',
+                'val': max(1, min(10, size / 1000)),
+                'group': Path(path).parent.name or 'root',
+                'path': path,
+                'size': size,
+                'chunks': path_chunk_count[path],
+                'fileSize': size,
+                'label': Path(path).name,
+                'last_updated': None,
+            })
+
+        # 质心计算
+        centroids = {}
+        for path, embs in path_embs.items():
+            arr = np.array(embs)
+            norms = np.linalg.norm(arr, axis=1, keepdims=True)
+            norms[norms == 0] = 1
+            arr = arr / norms
+            centroid = arr.mean(axis=0)
+            norm = np.linalg.norm(centroid)
+            if norm > 0:
+                centroid = centroid / norm
+            centroids[path] = centroid
+
+        # O(n²) 相似度链接
+        links = []
+        paths = sorted(centroids.keys())
+        for i, p1 in enumerate(paths):
+            for p2 in paths[i+1:]:
+                sim = float(np.dot(centroids[p1], centroids[p2]))
+                if sim > threshold:
+                    links.append({'source': p1, 'target': p2, 'weight': sim})
+
+        return {'nodes': nodes, 'links': links}
 
 # ---- WebSocket 广播管理 ----
 
@@ -609,6 +608,10 @@ class WebSocketManager:
 
 
 ws_manager = WebSocketManager()
+
+# ---- Graph 缓存（避免每次从 PG 读 228 条 embedding 字符串并解析）----
+_graph_cache = None   # {'centroids': {path: np.array}, 'version': int, 'updated_at': float}
+_graph_cache_version = 0
 
 
 async def _ws_handler(websocket):
