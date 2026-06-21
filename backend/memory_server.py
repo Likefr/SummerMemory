@@ -498,7 +498,7 @@ class MemorySystem:
         with self.conn.cursor() as cur:
             # 单次查询：path + metadata + embedding
             cur.execute("""
-                SELECT path, metadata, embedding
+                SELECT path, metadata, embedding, updated_at
                 FROM memories
                 WHERE embedding IS NOT NULL
                 ORDER BY path, chunk_index
@@ -508,12 +508,18 @@ class MemorySystem:
             path_meta = {}       # path -> metadata（取第一个）
             path_embs = {}        # path -> [np.array, ...]
             path_chunk_count = {} # path -> chunk 数
+            path_updated = {}    # path -> updated_at（取最新的）
 
             for row in cur.fetchall():
-                path, meta, emb_str = row
+                path, meta, emb_str, updated_at = row
                 if path not in path_meta:
                     path_meta[path] = meta
                     path_chunk_count[path] = 0
+                    path_updated[path] = updated_at
+                else:
+                    # 取更新的时间
+                    if updated_at and (path_updated[path] is None or updated_at > path_updated[path]):
+                        path_updated[path] = updated_at
                 if emb_str:
                     emb = np.array([float(x) for x in emb_str.strip('[]').split(',')])
                     path_embs.setdefault(path, []).append(emb)
@@ -524,6 +530,9 @@ class MemorySystem:
         for path in sorted(path_meta.keys()):
             meta = path_meta[path] or {}
             size = meta.get('size', 0)
+            updated = path_updated.get(path)
+            # 格式：2026-06-20T14:12:25（去掉毫秒）
+            updated_str = updated.strftime('%Y-%m-%dT%H:%M:%S') if updated else None
             nodes.append({
                 'id': path,
                 'name': Path(path).name,
@@ -535,7 +544,7 @@ class MemorySystem:
                 'chunks': path_chunk_count[path],
                 'fileSize': size,
                 'label': Path(path).name,
-                'last_updated': None,
+                'last_updated': updated_str,
             })
 
         # 质心计算
