@@ -5,6 +5,7 @@ SummerMemory HTTP Server
 """
 
 import json
+import os
 import sys
 import time
 import hashlib
@@ -460,11 +461,28 @@ class MemorySystem:
                 pass
 
     def search(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
-        """混合搜索：先尝试向量搜索，失败则回退到全文搜索"""
+        """
+        混合搜索：向量分数 × 0.6 + BM25 分数 × 0.4
+        - 短查询（<=2 字符）跳过向量，只走 BM25（更快更准）
+        - 正常查询同时跑两路，按合并分数排序
+        - 向量失败时回退到纯 BM25
+        """
         self._ensure_connection()
 
-        # 向量搜索
+        # --- 短查询快速路径：跳过 Ollama，只走 BM25 ---
+        query_stripped = query.strip()
+        if len(query_stripped) <= 2:
+            return self._bm25_search(query_stripped, limit)
+
+        # --- 正常路径：向量 + BM25 并行查询 ---
         embedding = self.get_embedding(query)
+
+        # BM25 搜索（用 jieba 分词后的 query）
+        segmented_query = self._segment_text(query)
+        bm25_results = self._bm25_search_raw(segmented_query, query, limit * 3)  # 多取一些用于合并
+
+        # 向量搜索
+        vec_results = []
         if embedding:
             try:
                 with self.conn.cursor() as cur:
@@ -475,32 +493,102 @@ class MemorySystem:
                         WHERE embedding IS NOT NULL
                         ORDER BY similarity DESC
                         LIMIT %s
-                    """, (embedding, limit))
-                    results = []
+                    """, (embedding, limit * 3))
                     for row in cur.fetchall():
-                        results.append({
+                        vec_results.append({
                             'path': row[0],
                             'content': row[1][:500],
                             'metadata': row[2],
                             'chunk_index': row[3],
-                            'similarity': round(row[4], 4)
+                            'vec_score': row[4],
                         })
-                    # 广播搜索命中的文件路径
-                    self._log_activity('search', path=results[0]['path'] if results else None, query=query)
-                    return results
             except Exception as e:
                 print(f"Vector search error: {e}")
 
-        # 回退：全文搜索
+        # --- 合并分数 ---
+        if not vec_results and not bm25_results:
+            self._log_activity('search', path=None, query=query)
+            return []
+
+        if not vec_results:
+            # 向量失败，只用 BM25
+            results = []
+            for r in bm25_results[:limit]:
+                results.append({
+                    'path': r['path'],
+                    'content': r['content'],
+                    'metadata': r['metadata'],
+                    'chunk_index': r['chunk_index'],
+                    'similarity': round(r['bm25_score'], 4),
+                })
+            self._log_activity('search', path=results[0]['path'] if results else None, query=query)
+            return results
+
+        # 归一化 BM25 分数到 0-1
+        max_bm25 = max((r['bm25_score'] for r in bm25_results), default=1.0)
+        if max_bm25 == 0:
+            max_bm25 = 1.0
+
+        # 构建 path+chunk_index -> bm25_score 映射
+        bm25_map = {}
+        for r in bm25_results:
+            key = (r['path'], r['chunk_index'])
+            bm25_map[key] = r['bm25_score'] / max_bm25
+
+        # 合并：以向量结果为主，叠加 BM25 加分
+        merged = []
+        for r in vec_results:
+            key = (r['path'], r['chunk_index'])
+            vec_score = r['vec_score']
+            bm25_norm = bm25_map.get(key, 0.0)
+            final_score = vec_score * 0.6 + bm25_norm * 0.4
+            merged.append({
+                'path': r['path'],
+                'content': r['content'],
+                'metadata': r['metadata'],
+                'chunk_index': r['chunk_index'],
+                'similarity': round(final_score, 4),
+                'vec_score': round(vec_score, 4),
+                'bm25_score': round(bm25_norm, 4),
+            })
+
+        # 补充：只在 BM25 命中但向量未命中的结果（如果有空位）
+        vec_keys = {(r['path'], r['chunk_index']) for r in vec_results}
+        for r in bm25_results:
+            key = (r['path'], r['chunk_index'])
+            if key not in vec_keys:
+                bm25_norm = r['bm25_score'] / max_bm25
+                merged.append({
+                    'path': r['path'],
+                    'content': r['content'],
+                    'metadata': r['metadata'],
+                    'chunk_index': r['chunk_index'],
+                    'similarity': round(bm25_norm * 0.4, 4),
+                    'vec_score': 0.0,
+                    'bm25_score': round(bm25_norm, 4),
+                })
+
+        # 按合并分数排序，取 Top-K
+        merged.sort(key=lambda x: x['similarity'], reverse=True)
+        results = merged[:limit]
+
+        self._log_activity('search', path=results[0]['path'] if results else None, query=query)
+        return results
+
+    def _bm25_search_raw(self, segmented_query: str, original_query: str, limit: int) -> List[Dict[str, Any]]:
+        """BM25 全文搜索，返回原始分数（未归一化）"""
+        # 将 jieba 分词结果转换为合法的 tsquery：多个 token 用 & 连接
+        tokens = [t.strip() for t in segmented_query.split() if t.strip()]
+        tsq = ' & '.join(tokens) if tokens else original_query.strip()
         with self.conn.cursor() as cur:
             cur.execute("""
                 SELECT path, content, metadata, chunk_index,
-                       ts_rank(content_tsv, plainto_tsquery('simple', %s)) AS rank
+                       ts_rank(content_tsv, to_tsquery('simple', %s)) AS rank
                 FROM memories
-                WHERE content_tsv @@ plainto_tsquery('simple', %s)
+                WHERE content_tsv @@ to_tsquery('simple', %s)
                 ORDER BY rank DESC
                 LIMIT %s
-            """, (query, query, limit))
+            """, (tsq, tsq, limit))
             results = []
             for row in cur.fetchall():
                 results.append({
@@ -508,11 +596,25 @@ class MemorySystem:
                     'content': row[1][:500],
                     'metadata': row[2],
                     'chunk_index': row[3],
-                    'similarity': round(row[4], 4)
+                    'bm25_score': row[4],
                 })
-            # 广播搜索命中的文件路径
-            self._log_activity('search', path=results[0]['path'] if results else None, query=query)
             return results
+
+    def _bm25_search(self, query: str, limit: int) -> List[Dict[str, Any]]:
+        """纯 BM25 搜索（用于短查询快速路径），对 query 做 jieba 分词"""
+        segmented = self._segment_text(query)
+        results = self._bm25_search_raw(segmented, query, limit)
+        output = []
+        for r in results:
+            output.append({
+                'path': r['path'],
+                'content': r['content'],
+                'metadata': r['metadata'],
+                'chunk_index': r['chunk_index'],
+                'similarity': round(r['bm25_score'], 4),
+            })
+        self._log_activity('search', path=output[0]['path'] if output else None, query=query)
+        return output
 
     def get_stats(self) -> Dict[str, Any]:
         """获取系统统计信息"""
@@ -746,7 +848,7 @@ class MemoryHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({
                 'version': version,
-                'frontend': 'v260612.2146'
+                'frontend': os.environ.get('FRONTEND_VERSION', 'dev')
             }).encode())
 
         elif path == '/timeline':
