@@ -21,6 +21,7 @@ import os
 import re
 import threading
 import time
+from collections import OrderedDict
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -72,6 +73,26 @@ MIN_MERGE_CHARS = 50
 # 融合权重（v2.0 调优：BM25 是主力，向量是语义补充）
 W_VECTOR = 0.55
 W_BM25 = 0.45
+
+# 查询缓存（LRU 200 条，命中直接返回，0ms）
+_QUERY_CACHE = OrderedDict()
+_QUERY_CACHE_LOCK = threading.Lock()
+CACHE_MAX = 200
+
+
+def cache_get(key):
+    with _QUERY_CACHE_LOCK:
+        if key in _QUERY_CACHE:
+            _QUERY_CACHE.move_to_end(key)
+            return _QUERY_CACHE[key]
+    return None
+
+
+def cache_put(key, value):
+    with _QUERY_CACHE_LOCK:
+        _QUERY_CACHE[key] = value
+        if len(_QUERY_CACHE) > CACHE_MAX:
+            _QUERY_CACHE.popitem(last=False)
 
 
 # ============ 分块（v2.0 重做） ============
@@ -352,25 +373,43 @@ class MemorySystem:
         if not query:
             return []
 
+        # 缓存命中直接返回（0ms）
+        cache_key = f"{query}:{limit}"
+        cached = cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         tokens = [t for t in jieba.cut_for_search(query) if t.strip()]
 
         # ---- ① 精确直达（文件名/日期）----
         exact = self._exact_match(query, limit)
         exact_paths = {r["path"] for r in exact}
 
-        # ---- ② BM25 ----
-        bm25_results = self._bm25_search(query, tokens, limit * 5)
+        # ---- ② BM25 与 ③ 向量化并行执行（总耗时 = 较慢者，而非相加）----
+        use_vector = len(query) > 4  # >4 字才走向量（坑9）
+        vec_holder = {}
 
-        # ---- ③ 向量（短查询跳过：坑9）----
+        def _vec_worker():
+            if use_vector:
+                emb = get_embedding(query)
+                if emb:
+                    emb_str = "[" + ",".join(str(x) for x in emb) + "]"
+                    vec_holder["emb_str"] = emb_str
+
+        t_vec = threading.Thread(target=_vec_worker)
+        t_vec.start()
+        bm25_results = self._bm25_search(query, tokens, limit * 5)
+        t_vec.join(timeout=30)
+
+        # 向量检索（与 BM25 并行完成嵌入后）
         vec_results = []
-        if len(query) > 4:  # >4 字才走向量（纯关键词短查走 BM25 更准更快）
-            emb = get_embedding(query)
-            if emb:
-                emb_str = "[" + ",".join(str(x) for x in emb) + "]"
-                vec_results = self._vector_search(emb_str, limit * 5)
+        if "emb_str" in vec_holder:
+            vec_results = self._vector_search(vec_holder["emb_str"], limit * 5)
 
         # ---- 融合 ----
-        return self._fuse(exact, bm25_results, vec_results, exact_paths, limit)
+        result = self._fuse(exact, bm25_results, vec_results, exact_paths, limit)
+        cache_put(cache_key, result)
+        return result
 
     def _exact_match(self, query: str, limit: int) -> List[Dict]:
         """精确直达：路径含查询词（如日期、文件名）"""
