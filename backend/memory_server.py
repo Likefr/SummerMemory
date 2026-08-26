@@ -304,6 +304,20 @@ class MemorySystem:
                 results["failed"] += 1
                 results["details"].append({"path": str(f), "status": "failed", "error": str(e)})
 
+        # 清理孤儿 chunks（源文件已删除的记忆，索引同步删除）
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT path FROM memories")
+            db_paths = [r[0] for r in cur.fetchall()]
+            removed = []
+            for rel in db_paths:
+                abs_path = WORKSPACE / rel
+                if not abs_path.exists():
+                    cur.execute("DELETE FROM memories WHERE path=%s", (rel,))
+                    removed.append(rel)
+            if removed:
+                print(f"[index] 清理 {len(removed)} 个已删除文件的孤儿chunks")
+                results["removed"] = len(removed)
+
         self.conn.commit()
         return results
 
