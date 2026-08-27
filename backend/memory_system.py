@@ -20,11 +20,22 @@ def conv_list(keyword=None):
         return json.loads(response.read().decode())
 
 def conv_get(session_key):
-    """获取完整会话"""
-    # dashboard key 自动转 UUID（兼容 webchat 复制的 key）
+    """获取完整会话（支持 session_key、dashboard key、sessionId）"""
+    # dashboard key (agent:main:dashboard:xxx) 自动转为真实 session_key
     if "dashboard:" in session_key:
-        import sessions_keymap
-        session_key = sessions_keymap.resolve(session_key) or session_key
+        _sessions_cache = getattr(conv_get, '_cache', None)
+        if _sessions_cache is None:
+            import os
+            sp = os.path.expanduser("~/.openclaw/agents/main/sessions/sessions.json")
+            try:
+                _sessions_cache = json.load(open(sp))
+                setattr(conv_get, '_cache', _sessions_cache)
+            except Exception:
+                _sessions_cache = {}
+                setattr(conv_get, '_cache', _sessions_cache)
+        entry = _sessions_cache.get(session_key)
+        if entry and entry.get("sessionId"):
+            session_key = f"agent:main:{entry['sessionId']}"
     url = f"{SERVER_URL}/conv/get?" + urllib.parse.urlencode({"key": session_key})
     with urllib.request.urlopen(url, timeout=15) as response:
         return json.loads(response.read().decode())

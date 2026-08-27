@@ -34,6 +34,22 @@ def _ensure_conn():
     return _conn
 
 
+def resolve_session_key(session_id):
+    """将 sessionId (agent:main:xxx) 解析为 dashboard key（如果存在映射）"""
+    try:
+        conn = _ensure_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT dashboard_key FROM session_key_map WHERE jsonl_uuid = %s",
+                (session_id,))
+            row = cur.fetchone()
+            if row:
+                return row[0]
+    except Exception:
+        pass
+    return session_id
+
+
 def db_insert(session_key, role, content, timestamp, seq=None, session_file=None):
     """psycopg2 直连插入，内容+时间双重去重（防 hook/watcher 双路重复）"""
     content_json = json.dumps(content, ensure_ascii=False)
@@ -105,6 +121,7 @@ def archive_file(path: Path):
         return
 
     session_key = f"agent:main:{path.stem.split('_')[-1]}"
+    session_key = resolve_session_key(session_key)  # 优先用 dashboard key，/clear 后同一会话不断裂
     session_file = path.name
     # seq 从当前文件已归档的行数开始累计
     base_seq = state.get(key, {}).get("seq", 0)

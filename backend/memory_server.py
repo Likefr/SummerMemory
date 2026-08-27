@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 
 import jieba
+import numpy as np
 import psycopg2
 import psycopg2.extras
 
@@ -229,6 +230,7 @@ class MemorySystem:
         self.conn = None
         self._ensure_connection()
         self._ensure_tables()
+        self._ensure_graph_cache_table()
 
     def _ensure_connection(self):
         if self.conn and not self.conn.closed:
@@ -281,6 +283,97 @@ class MemorySystem:
                 cur.execute("ALTER TABLE memories ALTER COLUMN embedding TYPE vector(1024)")
         self.conn.commit()
 
+    # ---------- 图谱质心缓存表（内存开销0，DB管理）----------
+    def _ensure_graph_cache_table(self):
+        """质心缓存表：path 主键 + 1024维质心 + 元信息。graph-data 直接查这张表"""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS graph_centroids (
+                    path TEXT PRIMARY KEY,
+                    centroid vector(1024),
+                    chunks INTEGER,
+                    size INTEGER,
+                    updated_at TIMESTAMP
+                )
+            """)
+        self.conn.commit()
+
+    def _refresh_graph_centroid(self, path: str):
+        """增量刷新单文件质心（index 时调用）"""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT count(*), coalesce(max((metadata->>'size')::int), 0),
+                           max(metadata->>'mtime'), avg(embedding)::text
+                    FROM memories WHERE path=%s AND embedding IS NOT NULL
+                """, (path,))
+                row = cur.fetchone()
+                if not row or not row[0] or not row[3]:
+                    cur.execute("DELETE FROM graph_centroids WHERE path=%s", (path,))
+                    return
+                chunks, size, mtime_str, cent_str = row
+                updated = datetime.fromisoformat(mtime_str) if mtime_str else None
+                vec = json.loads(cent_str)
+                # 归一化质心
+                n = math.sqrt(sum(x*x for x in vec)) or 1.0
+                vec = [x/n for x in vec]
+                cent_pg = "[" + ",".join(str(x) for x in vec) + "]"
+                cur.execute("""
+                    INSERT INTO graph_centroids (path, centroid, chunks, size, updated_at)
+                    VALUES (%s, %s::vector, %s, %s, %s)
+                    ON CONFLICT (path) DO UPDATE SET
+                        centroid=EXCLUDED.centroid, chunks=EXCLUDED.chunks,
+                        size=EXCLUDED.size, updated_at=EXCLUDED.updated_at
+                """, (path, cent_pg, chunks, size or chunks*800, updated))
+        except Exception as e:
+            print(f"[GraphCache] 刷新 {path} 失败: {e}")
+
+    def rebuild_all_centroids(self):
+        """全量重建质心（初始化或大批量变更后）"""
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT path FROM memories WHERE embedding IS NOT NULL")
+            paths = [r[0] for r in cur.fetchall()]
+        for p in paths:
+            self._refresh_graph_centroid(p)
+        self.conn.commit()
+
+    def get_graph_data(self, threshold: float = 0.85) -> Dict[str, Any]:
+        """图谱数据：质心表直查（DB聚合，内存0开销），nodes按path字母序（对齐旧版）"""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT path, chunks, size, updated_at, centroid::text
+                FROM graph_centroids ORDER BY path
+            """)
+            rows = cur.fetchall()
+        nodes, vecs = [], {}
+        for path, chunks, size, updated, cent in rows:
+            try:
+                v = json.loads(cent)
+                vecs[path] = v
+            except Exception:
+                continue
+            updated_str = updated.strftime("%Y-%m-%dT%H:%M:%S") if hasattr(updated, "strftime") else str(updated)
+            nodes.append({
+                "id": path, "name": Path(path).name, "type": "file",
+                "val": max(1, min(10, size / 1000)),
+                "group": Path(path).parent.name or "root",
+                "path": path, "size": size, "chunks": chunks,
+                "fileSize": size, "label": Path(path).name,
+                "last_updated": updated_str,
+            })
+        # O(n^2) 链接 —— numpy 矩阵化（176文件 <10ms）
+        links = []
+        paths = sorted(vecs.keys())
+        if paths:
+            M = np.array([vecs[p] for p in paths])          # (n, 1024)
+            S = M @ M.T                                       # 全量余弦矩阵
+            iu = np.triu_indices(len(paths), k=1)              # 上三角对
+            sims = S[iu]
+            mask = sims > threshold
+            for (i, j), sim in zip(zip(iu[0][mask], iu[1][mask]), sims[mask]):
+                links.append({"source": paths[i], "target": paths[j], "weight": float(sim)})
+        return {"nodes": nodes, "links": links}
+
     # ---------- 索引 ----------
     def index_workspace(self) -> Dict[str, Any]:
         """全量/增量索引 memory 目录"""
@@ -296,10 +389,19 @@ class MemorySystem:
             f_str = str(f)
             if '.dreams' in f_str or 'node_modules' in f_str or 'dreaming' in f_str:
                 continue
+            # 代码级排除 OpenClaw session-memory hook 的会话快照（YYYY-MM-DD-HHMM.md）：
+            # 该 hook 在 /new /reset 时自动 dump 最后15条对话，属于官方机制继续保留文件本身，
+            # 但完整对话已在 conversations 表，快照不进搜索索引/图谱（2026-08-26 主人指示）
+            import re as _re_idx
+            if _re_idx.match(r'\d{4}-\d{2}-\d{2}-\d{4}\.md$', f.name):
+                continue
+
             try:
                 result = self._index_file(f, memory_dir)
                 results[result["status"]] = results.get(result["status"], 0) + 1
-                results["details"].append(result)
+                # unchanged 只计数不进 details（避免输出刷屏）；变更/失败才记录明细
+                if result["status"] != "unchanged":
+                    results["details"].append(result)
             except Exception as e:
                 results["failed"] += 1
                 results["details"].append({"path": str(f), "status": "failed", "error": str(e)})
@@ -318,6 +420,11 @@ class MemorySystem:
                 print(f"[index] 清理 {len(removed)} 个已删除文件的孤儿chunks")
                 results["removed"] = len(removed)
 
+        self.conn.commit()
+        # 增量刷新变更文件的图谱质心
+        for d in results["details"]:
+            if d.get("status") in ("updated", "indexed"):
+                self._refresh_graph_centroid(d["path"])
         self.conn.commit()
         return results
 
@@ -365,11 +472,12 @@ class MemorySystem:
                 emb = embeddings[i]
                 # emb 转 pgvector 字符串
                 emb_str = "[" + ",".join(str(x) for x in emb) + "]" if emb else None
+                mtime_iso = datetime.fromtimestamp(f.stat().st_mtime).isoformat()
                 cur.execute("""
                     INSERT INTO memories (path, content, heading, embedding, content_tsv, metadata, hash, chunk_index)
                     VALUES (%s, %s, %s, %s::vector, to_tsvector('simple', %s), %s::jsonb, %s, %s)
                 """, (rel_path, chunk["content"], chunk["heading"], emb_str,
-                      tok(text), json.dumps({"size": len(content)}), new_hash, i))
+                      tok(text), json.dumps({"size": len(content), "mtime": mtime_iso}), new_hash, i))
 
         return {"path": rel_path, "status": "updated", "chunks": len(chunks)}
 
@@ -545,6 +653,19 @@ class MemorySystem:
             })
         return final[:limit]
 
+    def get_timeline(self) -> Dict[str, Any]:
+        """时间轴：按文件真实修改时间(mtime)聚合，graph 前端用"""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT substring(metadata->>'mtime' from 1 for 10) AS date,
+                       count(DISTINCT path) AS files
+                FROM memories
+                WHERE metadata->>'mtime' IS NOT NULL
+                GROUP BY 1 ORDER BY 1 DESC LIMIT 90
+            """)
+            timeline = [{"date": r[0], "files": r[1]} for r in cur.fetchall()]
+        return {"timeline": timeline}
+
     # ---------- 统计 ----------
     def stats(self) -> Dict:
         with self.conn.cursor() as cur:
@@ -582,14 +703,37 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/health":
                 self._json({"status": "ok", "engine": OLLAMA_MODEL})
+            elif parsed.path == "/index":
+                # 手动重建索引（CLI: memory_system index 调用）
+                # 2026-08-26 v2.0 重构时误删，现补回；长任务给足超时
+                result = self.system.index_workspace()
+                self._json(result)
             elif parsed.path == "/search":
                 q = params.get("query", "")
                 limit = int(params.get("limit", 10))
-                self._json(self.system.search(q, limit))
-            elif parsed.path == "/index":
-                self._json(self.system.index_workspace())
+                result = self.system.search(q, limit)
+                self._json(result)
+                # 广播检索事件（graph 前端检索动画）
+                _broadcast_activity("search", query=q)
             elif parsed.path == "/stats":
                 self._json(self.system.stats())
+            elif parsed.path == "/graph-data":
+                threshold = float(params.get("threshold", 0.85))
+                self._json(self.system.get_graph_data(threshold))
+            elif parsed.path == "/version":
+                # 返回数据版本时间戳（memories 最大 updated_at 的 epoch）
+                # 前端轮询此值，变化时提示用户刷新（旧版行为，必须保留）
+                try:
+                    self.system._ensure_connection()
+                    with self.system.conn.cursor() as cur:
+                        cur.execute("SELECT EXTRACT(EPOCH FROM MAX(updated_at))::bigint FROM memories")
+                        row = cur.fetchone()
+                        ver = int(row[0]) if row and row[0] else 0
+                except Exception:
+                    ver = 0
+                self._json({"version": ver})
+            elif parsed.path == "/timeline":
+                self._json(self.system.get_timeline())
             elif parsed.path == "/conv/list":
                 self._json(self._conv_list(params.get("q")))
             elif parsed.path == "/conv/get":
@@ -621,19 +765,136 @@ class Handler(BaseHTTPRequestHandler):
                      "preview": (r[3] or "")[:100]} for r in cur.fetchall()]
 
     def _conv_get(self, key):
+        """获取完整会话，支持 session_key 或 sessionId UUID（dashboard key 兼容）"""
         with self.system.conn.cursor() as cur:
+            # 优先精确匹配 session_key
             cur.execute("""
                 SELECT role, timestamp, content::text
                 FROM conversations
                 WHERE session_key = %s ORDER BY timestamp, id
             """, (key,))
             rows = cur.fetchall()
+            # 精确没命中，尝试按 sessionId 模糊匹配（支持 dashboard key 场景）
+            if not rows and '-' in key:
+                cur.execute("""
+                    SELECT role, timestamp, content::text
+                    FROM conversations
+                    WHERE session_key LIKE %s ORDER BY timestamp, id
+                """, (f"%{key}%",))
+                rows = cur.fetchall()
             return [{"role": r[0], "timestamp": str(r[1]), "content": r[2][:2000]} for r in rows]
+
+
+# ---- WebSocket 广播管理（从 v1 移植，graph 前端检索动画/在线人数依赖此服务）----
+import asyncio
+import threading
+try:
+    import websockets
+    HAS_WEBSOCKETS = True
+except ImportError:
+    HAS_WEBSOCKETS = False
+
+WS_PORT = 8890  # graphWs 隧道端口（nginx /graphWs → frpc → 本机 8890）
+
+
+class WebSocketManager:
+    """管理所有 WebSocket 客户端连接，并提供线程安全的广播方法"""
+
+    def __init__(self):
+        self._clients = set()
+        self._loop = None  # WS 服务的 asyncio 事件循环（跨线程广播用）
+
+    def set_loop(self, loop):
+        self._loop = loop
+
+    def register(self, ws):
+        self._clients.add(ws)
+
+    def unregister(self, ws):
+        self._clients.discard(ws)
+
+    @property
+    def count(self):
+        return len(self._clients)
+
+    def broadcast_online_count(self):
+        """广播当前在线人数（连接/断开时触发）"""
+        self.broadcast({"type": "online_count", "count": self.count})
+
+    def broadcast(self, message: dict):
+        """线程安全地向所有 WS 客户端广播 JSON 消息（从任意线程调用）"""
+        if not self._clients or not self._loop or not self._loop.is_running():
+            return
+        data = json.dumps(message, ensure_ascii=False)
+        for ws in list(self._clients):
+            self._loop.call_soon_threadsafe(
+                asyncio.ensure_future, self._safe_send(ws, data))
+
+    @staticmethod
+    async def _safe_send(ws, data: str):
+        try:
+            await ws.send(data)
+        except Exception:
+            pass
+
+
+ws_manager = WebSocketManager()
+
+
+async def _ws_handler(websocket):
+    """单个 WS 连接的生命周期管理"""
+    ws_manager.register(websocket)
+    ws_manager.broadcast_online_count()
+    try:
+        async for _ in websocket:
+            pass  # 保持连接，等待客户端断开
+    except Exception:
+        pass
+    finally:
+        ws_manager.unregister(websocket)
+        ws_manager.broadcast_online_count()
+
+
+def _run_ws_server():
+    """在独立线程中运行 WS 服务（8890），供 graph 前端实时事件"""
+    if not HAS_WEBSOCKETS:
+        print("[WS] websockets 库未安装，跳过 WebSocket 服务")
+        return
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    ws_manager.set_loop(loop)
+
+    async def start():
+        # 新版 websockets 库不再接受 loop 参数；serve 在当前 loop 上运行
+        return await websockets.serve(_ws_handler, "0.0.0.0", WS_PORT)
+
+    try:
+        server = loop.run_until_complete(start())
+        print(f"[WS] WebSocket 服务运行在端口 {WS_PORT}")
+        loop.run_forever()
+    except Exception as e:
+        print(f"[WS] 启动失败: {e}")
+
+
+def _broadcast_activity(action: str, path: str = "", query: str = ""):
+    """广播 activity 事件（检索动画数据源），失败不影响主流程"""
+    try:
+        ws_manager.broadcast({
+            "type": "activity",
+            "action": action,
+            "path": path,
+            "query": query,
+        })
+    except Exception:
+        pass
 
 
 def main():
     print("[SummerMemory v2.0] 启动中...")
     Handler.system = MemorySystem()
+    # WebSocket 服务线程（graph 前端检索动画/在线人数）
+    ws_thread = threading.Thread(target=_run_ws_server, daemon=True)
+    ws_thread.start()
     server = HTTPServer(("0.0.0.0", PORT), Handler)
     print(f"[SummerMemory v2.0] 端口 {PORT} 就绪，引擎 {OLLAMA_MODEL}")
     server.serve_forever()
