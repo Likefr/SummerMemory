@@ -2,18 +2,18 @@
 """
 SummerMemory v2.0 — 记忆检索服务（彻底重构版）
 
-架构：三层漏斗 + 分数融合
+架构：三层漏斗 + RRF 排名融合（v2.1，对齐 Elasticsearch RRF retriever 标准）
   ① 精确直达：文件名/日期/标题直接匹配（<1ms）
   ② BM25 关键词：jieba 分词 + tsvector + 标题加权（5-20ms）
-  ③ 向量语义：bge-m3 Q8 1024维 + pgvector 余弦（~230ms）
-  融合：向量×0.55 + BM25×0.45，同文件只取最高分 chunk
+  ③ 向量语义：qwen3-embedding 0.6B Q8 1024维 + pgvector 余弦（与 BM25 并行）
+  融合：RRF 排名融合 Σ 1/(k+rank)，k=60（ES 默认），双路等权，同文件取最高分 chunk
 
 历史教训（v1 的 9 个坑，重构时全部规避）：
-  - 坑1-4: 排序算法缺陷 → 三层漏斗 + 分数融合替代 RRF/重排
+  - 坑1-4: 排序算法缺陷 → 三层漏斗；v2.1 用 RRF 排名融合（ES 标准）替代分数加权，不再带 Reranker
   - 坑5-6: 分块丢上下文 → 每块自带标题链 + 空标题并下文
-  - 坑7:   jina 量化版排序差 → bge-m3 Q8
+  - 坑7:   jina 量化版排序差 → bge-m3 Q8 → v2.1 升级 qwen3-embedding 0.6B
   - 坑8:   大文件chunk累加霸榜 → 同文件只取最高分
-  - 坑9:   短查询被挤掉 → 默认limit 10 + 短查询纯BM25
+  - 坑9:   短查询被挤掉 → v2.0 曾用「≤4字跳向量」修法；v2.1 废除门控，双路并行 + RRF 消化
 """
 import json
 import math
@@ -61,7 +61,7 @@ def _load_db_password():
 _load_db_password()
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "bge-m3:q8")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3-embedding:0.6b-q8_0")  # v2.1: bge-m3:q8 保留在 ollama，随时可切回
 VECTOR_DIM = 1024
 
 WORKSPACE = Path("/root/.openclaw/workspace")
@@ -72,8 +72,7 @@ MAX_CHUNK_CHARS = 800
 MIN_MERGE_CHARS = 50
 
 # 融合权重（v2.0 调优：BM25 是主力，向量是语义补充）
-W_VECTOR = 0.55
-W_BM25 = 0.45
+# v2.1: RRF 排名融合，不再使用固定权重（W_VECTOR/W_BM25 已废弃删除）
 
 # 查询缓存（LRU 200 条，命中直接返回，0ms）
 _QUERY_CACHE = OrderedDict()
@@ -94,6 +93,12 @@ def cache_put(key, value):
         _QUERY_CACHE[key] = value
         if len(_QUERY_CACHE) > CACHE_MAX:
             _QUERY_CACHE.popitem(last=False)
+
+
+def cache_clear():
+    """消空查询缓存（索引更新后调用，防止旧结果滞留）"""
+    with _QUERY_CACHE_LOCK:
+        _QUERY_CACHE.clear()
 
 
 # ============ 分块（v2.0 重做） ============
@@ -421,6 +426,9 @@ class MemorySystem:
                 results["removed"] = len(removed)
 
         self.conn.commit()
+        # 索引变更后清空查询缓存（v2.1 修复：防止搜到旧结果，TODO.md 事件发现）
+        if results.get("updated") or results.get("indexed") or results.get("removed"):
+            cache_clear()
         # 增量刷新变更文件的图谱质心
         for d in results["details"]:
             if d.get("status") in ("updated", "indexed"):
@@ -508,15 +516,14 @@ class MemorySystem:
         exact_paths = {r["path"] for r in exact}
 
         # ---- ② BM25 与 ③ 向量化并行执行（总耗时 = 较慢者，而非相加）----
-        use_vector = len(query) > 4  # >4 字才走向量（坑9）
+        # v2.1: 删除短查询门控（原坑9修法）——ES/Qdrant 无此规则，短词语义召回交给 RRF 融合消化
         vec_holder = {}
 
         def _vec_worker():
-            if use_vector:
-                emb = get_embedding(query)
-                if emb:
-                    emb_str = "[" + ",".join(str(x) for x in emb) + "]"
-                    vec_holder["emb_str"] = emb_str
+            emb = get_embedding(query)
+            if emb:
+                emb_str = "[" + ",".join(str(x) for x in emb) + "]"
+                vec_holder["emb_str"] = emb_str
 
         t_vec = threading.Thread(target=_vec_worker)
         t_vec.start()
@@ -534,15 +541,16 @@ class MemorySystem:
         return result
 
     def _exact_match(self, query: str, limit: int) -> List[Dict]:
-        """精确直达：路径含查询词（如日期、文件名）"""
+        """精确直达：仅路径/文件名/日期命中（v2.1 方案A：去掉 heading 匹配，
+        标题命中交给 BM25 的 ×2 加权和 RRF 公平竞争，防止 exact 无上限置顶挤掉正文召回）"""
         try:
             with self.conn.cursor() as cur:
                 cur.execute("""
                     SELECT DISTINCT ON (path) path, content, heading, chunk_index
                     FROM memories
-                    WHERE path ILIKE %s OR heading ILIKE %s
+                    WHERE path ILIKE %s
                     LIMIT %s
-                """, (f"%{query}%", f"%{query}%", limit))
+                """, (f"%{query}%", limit))
                 return [{"path": r[0], "content": r[1], "heading": r[2],
                          "chunk_index": r[3], "exact": True} for r in cur.fetchall()]
         except Exception:
@@ -606,33 +614,45 @@ class MemorySystem:
             return []
 
     def _fuse(self, exact, bm25_results, vec_results, exact_paths, limit) -> List[Dict]:
-        """分数融合：向量0.55 + BM25 0.45，同文件只取最高分（坑8），精确直达置顶"""
-        vec_max = max((r["vec_score"] for r in vec_results), default=0) or 1.0
-        bm25_max = max((r["bm25_score"] for r in bm25_results), default=0) or 1.0
+        """
+        v2.1 RRF 排名融合（对齐 Elasticsearch RRF retriever 默认形态）
+        score(d) = Σ 1/(k + rank)，k=60（ES rank_constant 默认），rank 1-based
+        - 双路等权，文档双路命中则贡献累加（ES 公式：score += 1/(k+rank)）
+        - 同文件每路只取最优块再参与（坑8 防霸榜，等价 ES collapse）
+        - 一路未召回不拖累另一路（治：BM25 零分稀释向量语义召回）
+        - 精确直达置顶不参与 RRF 竞争（记忆系统刚需，自家扩展层）
+        """
+        K = 60  # ES rank_constant 默认值，业界共识
 
-        merged = {}  # path -> best
+        def best_per_file(results):
+            """结果已按本路降序，同文件取首个出现的块 = 该路最优块"""
+            best = {}
+            for pos, r in enumerate(results, start=1):
+                if r["path"] not in best:
+                    best[r["path"]] = (pos, r)  # (该路排名, 块数据)
+            return best
 
-        def offer(item, score):
-            p = item["path"]
-            if p not in merged or score > merged[p]["score"]:
-                merged[p] = {**item, "score": score}
+        vec_best = best_per_file(vec_results)     # path -> (向量路排名, chunk)
+        bm25_best = best_per_file(bm25_results)   # path -> (BM25路排名, chunk)
 
-        # 向量命中
-        for r in vec_results:
-            nv = r["vec_score"] / vec_max
-            nb = (r.get("bm25_score", 0) / bm25_max) if r.get("bm25_score") else 0
-            offer(r, nv * W_VECTOR + nb * W_BM25)
+        scores, items = {}, {}  # path -> rrf总分, path -> 展示块
 
-        # BM25 命中但向量没有的
-        vec_paths = {r["path"] for r in vec_results}
-        for r in bm25_results:
-            if r["path"] not in vec_paths:
-                offer(r, (r["bm25_score"] / bm25_max) * W_BM25)
+        def accumulate(best):
+            """把某一路的排名转成 RRF 贡献并累加"""
+            for p, (rank, item) in best.items():
+                c = 1.0 / (K + rank)  # 该路 RRF 贡献：排名越靠前贡献越大
+                scores[p] = scores.get(p, 0.0) + c
+                # 展示块 = 贡献更大的那路的块（两路都命中时取更优路的）
+                if p not in items or c > items[p]["_contrib"]:
+                    items[p] = {**item, "_contrib": c}
 
-        # 排序：精确直达 > 分数
-        ranked = sorted(merged.values(), key=lambda x: x.get("score", 0), reverse=True)
+        accumulate(vec_best)
+        accumulate(bm25_best)
 
-        # 精确匹配的置顶
+        # 按 RRF 总分降序
+        ranked = sorted(scores, key=lambda p: scores[p], reverse=True)
+
+        # 精确匹配的置顶（保持 v2.0 行为不变）
         final = []
         for e in exact:
             final.append({
@@ -640,16 +660,19 @@ class MemorySystem:
                 "chunk_index": e.get("chunk_index", 0),
                 "similarity": 1.0, "matched_by": "exact",
             })
-        for r in ranked:
-            if r["path"] in exact_paths:
+        for p in ranked:
+            if p in exact_paths:
                 continue
             if len(final) >= limit:
                 break
+            it = items[p]
+            in_vec, in_bm = p in vec_best, p in bm25_best
+            matched = "vector+bm25" if (in_vec and in_bm) else ("vector" if in_vec else "bm25")
             final.append({
-                "path": r["path"], "content": r["content"], "heading": r.get("heading", ""),
-                "chunk_index": r.get("chunk_index", 0),
-                "similarity": round(r.get("score", 0), 6),
-                "matched_by": "vector+bm25" if r["path"] in vec_paths else "bm25",
+                "path": p, "content": it["content"], "heading": it.get("heading", ""),
+                "chunk_index": it.get("chunk_index", 0),
+                "similarity": round(scores[p], 6),
+                "matched_by": matched,
             })
         return final[:limit]
 
