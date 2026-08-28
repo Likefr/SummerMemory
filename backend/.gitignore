@@ -41,3 +41,4 @@ data/
 
 # Memory files (private)
 memory/
+.watcher_state.json
