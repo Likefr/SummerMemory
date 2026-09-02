@@ -210,7 +210,7 @@ flowchart TB
         S1["三层漏斗搜索引擎"]
         S2["图谱数据 API（质心预计算）"]
         S3["增量索引管理"]
-        S4["对话归档 watcher"]
+        S4["对话归档 /archive 推流端点"]
         S5["WebSocket 实时推送"]
     end
 
@@ -250,7 +250,7 @@ flowchart TB
 | **写入** | 记忆文件 → 标题链分块 + jieba 分词 + bge-m3 向量化 → PostgreSQL（HNSW + TSVECTOR） |
 | **搜索** | 查询 → 缓存/精确/BM25/向量三层漏斗 → 分数融合（0.55/0.45）→ 同文件去重 |
 | **图谱** | 文件质心预计算（DB 表存储，零内存开销）→ 力导向图可视化 |
-| **归档** | OpenClaw 会话 jsonl 实时监控 → dashboard key 归一 → conversations 表（可选模块，需单独启动 watcher） |
+| **归档** | 外部推送（hook POST /archive）→ 去重 → conversations 表；session_key_map 维护 dashboard_key ← sessionId 身份映射（/clear 换 id 仍可追溯） |
 | **推送** | 检索/索引事件 → WebSocket 广播 → 前端检索动画 |
 
 ### 图谱可视化
@@ -311,10 +311,14 @@ cd backend
 pip install -r requirements.txt
 python memory_server.py        # HTTP :11435 + WebSocket :8890
 
-# 对话归档（可选模块，需单独启动）
-# 监控 OpenClaw 会话文件变化，实时归档对话到数据库
-# 路径配置在脚本顶部 SESSIONS_DIR，按需修改
-python sessions_watcher.py
+# 对话归档（可选模块）
+# 推流架构：外部 hook 监听消息事件，POST 到 /archive 实时入库
+# 例：OpenClaw 用户可启用 conversation-archive hook（见下方）
+# curl -X POST http://localhost:11435/archive -H 'Content-Type: application/json' \
+#   -d '{"session_key":"agent:main:dashboard:xxx","role":"user","content":"你好","timestamp":"2026-09-02T10:00:00+08:00"}'
+#
+# 查询（支持 session_key / 裸 sessionId，sessionId 经 session_key_map 自动换 key）：
+# memory_system conv get agent:main:dashboard:xxx
 ```
 
 ### 环境变量配置
@@ -345,7 +349,8 @@ python sessions_watcher.py
 | `/graph-data?threshold=0.85` | GET | 图谱节点+连线（质心预计算） |
 | `/timeline` | GET | 时间轴（按文件真实 mtime 聚合） |
 | `/conv/list?q=关键词` | GET | 对话归档列表 |
-| `/conv/get?key=会话key` | GET | 完整对话内容 |
+| `/conv/get?key=会话key` | GET | 完整对话内容（支持 session_key / 尾部UUID / 裸 sessionId 三种形式） |
+| `/archive` | POST | 对话推流归档入口：`{session_key, session_id?, role, content, timestamp}`，去重入库 + 身份映射 upsert |
 
 ### WebSocket（:8890）
 
@@ -397,7 +402,7 @@ SummerMemory/
 ├── backend/                    ← 后端服务
 │   ├── memory_server.py        ← HTTP + WebSocket 服务（三层漏斗搜索、图谱、推送）
 │   ├── memory_system.py        ← CLI 命令行工具（搜索/索引/归档查询）
-│   ├── sessions_watcher.py     ← 对话归档守护进程（监控 OpenClaw 会话文件）
+│   ├── sessions_watcher.py     ← （已废弃）历史 jsonl 轮询器，推流架构下线
 │   ├── requirements.txt        ← Python 依赖（psycopg2 + jieba + websockets）
 │   ├── Dockerfile              ← 后端容器构建
 │   ├── docker-compose.yml      ← 一键部署编排（PG + Ollama + Server）

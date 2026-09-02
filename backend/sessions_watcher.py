@@ -1,26 +1,31 @@
 #!/usr/bin/env python3
-"""Sessions JSONL watcher - 实时归档 OpenClaw 会话消息到 SummerMemory conversations 表
+"""Sessions watcher - 实时归档 OpenClaw 会话消息到 SummerMemory conversations 表
 
-监控 /root/.openclaw/agents/main/sessions/*.jsonl 文件变化，增量解析新行，
-把 user/assistant 消息写入 conversations 表（纯归档，不进搜索）。
+新版 OpenClaw(2026.8+) 会话不再写入 JSONL 文件，全部存在 agent SQLite:
+  /root/.openclaw/agents/main/agent/openclaw-agent.sqlite
+  - transcript_events(session_id, seq, event_json)  事件流(含 user/assistant 消息)
+  - session_windows(session_id, session_key)        会话身份映射(稳定 key)
+
+本脚本只读轮询该库新增消息事件，归档到 SummerMemory conversations 表(纯归档，不进搜索)。
+WAL 模式下只读连接不影响网关写入。
 
 用法: sessions_watcher.py [--once]  (默认常驻)
 """
 import json
-import os
 import sys
 import time
-import subprocess
+import sqlite3
 from pathlib import Path
 
 import psycopg2
 
-SESSIONS_DIR = Path("/root/.openclaw/agents/main/sessions")
+AGENT_DB = Path("/root/.openclaw/agents/main/agent/openclaw-agent.sqlite")
 STATE_FILE = Path("/root/.openclaw/workspace/projects/SummerMemory/backend/.watcher_state.json")
+POLL_SECONDS = 2
 
+# state 结构: { "<session_id>": {"seq": 已归档最大事件seq, "archived": 已写入条数} }
 state = {}
 
-# 直连 PostgreSQL（Docker 容器映射到 127.0.0.1:5432）
 _conn = None
 
 def _ensure_conn():
@@ -34,24 +39,8 @@ def _ensure_conn():
     return _conn
 
 
-def resolve_session_key(session_id):
-    """将 sessionId (agent:main:xxx) 解析为 dashboard key（如果存在映射）"""
-    try:
-        conn = _ensure_conn()
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT dashboard_key FROM session_key_map WHERE jsonl_uuid = %s",
-                (session_id,))
-            row = cur.fetchone()
-            if row:
-                return row[0]
-    except Exception:
-        pass
-    return session_id
-
-
 def db_insert(session_key, role, content, timestamp, seq=None, session_file=None):
-    """psycopg2 直连插入，内容+时间双重去重（防 hook/watcher 双路重复）"""
+    """psycopg2 直连插入，内容+时间双重去重(防重复归档)"""
     content_json = json.dumps(content, ensure_ascii=False)
     conn = _ensure_conn()
     try:
@@ -73,12 +62,10 @@ def db_insert(session_key, role, content, timestamp, seq=None, session_file=None
     except Exception as e:
         conn.rollback()
         print(f"db_insert error: {e}", file=sys.stderr, flush=True)
-        # 连接坏了就重建
         try:
             _conn.close()
         except Exception:
             pass
-        global _conn_ref
         _conn = None
         return 0
 
@@ -90,6 +77,9 @@ def load_state():
             state = json.loads(STATE_FILE.read_text())
         except Exception:
             state = {}
+    # 兼容旧格式(按 jsonl 路径记): 旧格式不是 {"<id>":{"seq":..}} 则重置
+    if not all(isinstance(v, dict) and "seq" in v for v in state.values()):
+        state = {}
 
 
 def save_state():
@@ -98,129 +88,102 @@ def save_state():
     tmp.rename(STATE_FILE)
 
 
-def archive_file(path: Path):
-    """解析一个 jsonl 文件的新增行"""
-    key = str(path)
-    offset = state.get(key, {}).get("offset", 0)
-    mtime = state.get(key, {}).get("mtime", 0)
-
-    try:
-        st = os.stat(path)
-        if st.st_size < offset:
-            offset = 0  # 文件被重建，从头读
-        if st.st_mtime == mtime and st.st_size == offset:
-            return  # 无变化
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            f.seek(offset)
-            new_data = f.read()
-            new_offset = f.tell()
-    except FileNotFoundError:
-        return
-
-    if not new_data:
-        return
-
-    session_key = f"agent:main:{path.stem.split('_')[-1]}"
-    session_key = resolve_session_key(session_key)  # 优先用 dashboard key，/clear 后同一会话不断裂
-    session_file = path.name
-    # seq 从当前文件已归档的行数开始累计
-    base_seq = state.get(key, {}).get("seq", 0)
-    inserted = 0
-    for line in new_data.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if entry.get("type") != "message":
-            continue
-        msg = entry.get("message", {})
-        role = msg.get("role")
-        if role not in ("user", "assistant"):
-            continue
-        content = msg.get("content")
-        if isinstance(content, list):
-            parts = []
-            for c in content:
-                if not isinstance(c, dict):
-                    continue
-                if c.get("type") == "text":
-                    parts.append(c.get("text", ""))
-                elif c.get("type") == "toolCall":
-                    # 折中方案：只记 AI 干了什么（命令名+参数摘要），不记返回结果
-                    name = c.get("name", "?")
-                    args = c.get("arguments", {})
-                    # 参数取摘要：command/url/query/path 等常见字段，截 200 字
-                    summary = ""
-                    for f in ("command", "url", "query", "path", "name", "action", "prompt"):
-                        if isinstance(args, dict) and args.get(f):
-                            summary = str(args[f]).replace("\n", " ")[:200]
-                            break
-                    if not summary and isinstance(args, dict):
-                        summary = str(args)[:200]
-                    parts.append(f"[工具 {name}] {summary}")
-            text = "\n".join(parts)
-        elif isinstance(content, str):
-            text = content
-        else:
-            text = ""
-        if not text.strip():
-            continue
-        ts = entry.get("timestamp", "")
-        seq = base_seq + inserted
-        db_insert(session_key, role, text, ts, seq=seq, session_file=session_file)
-        inserted += 1
-
-    state[key] = {"offset": new_offset, "mtime": st.st_mtime, "seq": base_seq + inserted}
-    if inserted:
-        print(f"[{time.strftime('%H:%M:%S')}] {path.name}: archived {inserted} msgs", flush=True)
+def _extract(entry):
+    """从事件 JSON 提取可归档文本;非 user/assistant 消息返回 None"""
+    if entry.get("type") != "message":
+        return None
+    msg = entry.get("message", {})
+    role = msg.get("role")
+    if role not in ("user", "assistant"):
+        return None
+    content = msg.get("content")
+    if isinstance(content, list):
+        parts = []
+        for c in content:
+            if not isinstance(c, dict):
+                continue
+            if c.get("type") == "text":
+                parts.append(c.get("text", ""))
+            elif c.get("type") == "toolCall":
+                # 只记 AI 干了什么(命令名+参数摘要)，不记返回结果
+                name = c.get("name", "?")
+                args = c.get("arguments", {})
+                summary = ""
+                for f in ("command", "url", "query", "path", "name", "action", "prompt"):
+                    if isinstance(args, dict) and args.get(f):
+                        summary = str(args[f]).replace("\n", " ")[:200]
+                        break
+                if not summary and isinstance(args, dict):
+                    summary = str(args)[:200]
+                parts.append(f"[工具 {name}] {summary}")
+        text = "\n".join(parts)
+    elif isinstance(content, str):
+        text = content
+    else:
+        text = ""
+    if not text.strip():
+        return None
+    return role, text
 
 
 def scan_all():
-    for p in SESSIONS_DIR.glob("*.jsonl"):
-        if p.name.endswith(".trajectory.jsonl"):
-            continue
-        archive_file(p)
-
-
-def sync_key_map():
-    """把 sessions.json 的 dashboard→uuid 映射快照进库（会话删除后映射仍在）"""
+    """轮询新库：每会话归档 seq 大于上次进度的消息事件"""
+    if not AGENT_DB.exists():
+        return
     try:
-        with open('/root/.openclaw/agents/main/sessions/sessions.json') as f:
-            sidx = json.load(f)
-        conn = _ensure_conn()
-        with conn.cursor() as cur:
-            for key, entry in sidx.items():
-                sid = entry.get('sessionId')
-                if not sid or ':dashboard:' not in key:
+        db = sqlite3.connect(f"file:{AGENT_DB}?mode=ro", uri=True)
+        db.execute("PRAGMA query_only=1")
+    except sqlite3.Error as e:
+        print(f"open agent db error: {e}", file=sys.stderr, flush=True)
+        return
+    try:
+        heads = db.execute("""
+            SELECT e.session_id, w.session_key, MAX(e.seq)
+            FROM transcript_events e
+            JOIN session_windows w ON w.session_id = e.session_id
+            GROUP BY e.session_id, w.session_key
+        """).fetchall()
+        for session_id, session_key, max_seq in heads:
+            last = state.get(session_id, {}).get("seq", 0)
+            if max_seq <= last:
+                continue
+            rows = db.execute(
+                "SELECT seq, event_json FROM transcript_events"
+                " WHERE session_id = ? AND seq > ? ORDER BY seq",
+                (session_id, last)).fetchall()
+            base = state.get(session_id, {}).get("archived", 0)
+            inserted = 0
+            for seq, event_json in rows:
+                try:
+                    entry = json.loads(event_json)
+                except json.JSONDecodeError:
                     continue
-                cur.execute("""
-                    INSERT INTO session_key_map (dashboard_key, jsonl_uuid, session_file)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (dashboard_key) DO UPDATE
-                    SET jsonl_uuid = EXCLUDED.jsonl_uuid, session_file = EXCLUDED.session_file, mapped_at = NOW()
-                """, (key, f"agent:main:{sid}", entry.get('sessionFile', '')))
-        conn.commit()
-    except Exception as e:
-        print(f"sync_key_map error: {e}", file=sys.stderr, flush=True)
+                extracted = _extract(entry)
+                if not extracted:
+                    continue
+                role, text = extracted
+                ts = entry.get("timestamp", "")
+                db_insert(session_key, role, text, ts,
+                          seq=base + inserted, session_file=f"{session_id[:8]}.sqlite")
+                inserted += 1
+            state[session_id] = {"seq": max_seq, "archived": base + inserted}
+            if inserted:
+                print(f"[{time.strftime('%H:%M:%S')}] {session_key}: archived {inserted} msgs", flush=True)
+    finally:
+        db.close()
 
 
 def main():
     once = "--once" in sys.argv
-    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     load_state()
-    sync_key_map()
     scan_all()
     save_state()
     if once:
         return
     while True:
-        time.sleep(2)
+        time.sleep(POLL_SECONDS)
         scan_all()
         save_state()
-        sync_key_map()
 
 
 if __name__ == "__main__":

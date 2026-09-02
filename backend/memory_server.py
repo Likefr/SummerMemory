@@ -766,7 +766,62 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._json({"error": str(e)}, 500)
 
+    def do_POST(self):
+        """推流归档入口：conversation-archive hook 每条消息实时 POST 进来"""
+        parsed = urlparse.urlparse(self.path)
+        try:
+            if parsed.path == "/archive":
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length) if length else b"{}"
+                payload = json.loads(body.decode("utf-8"))
+                self._json(self._archive_insert(payload))
+            else:
+                self._json({"error": "not found"}, 404)
+        except Exception as e:
+            self._json({"error": str(e)}, 500)
+
     # ---- 对话归档（读取 v1 遗留的 conversations 表，功能不变）----
+    def _archive_insert(self, payload):
+        """推流归档入口：hook POST /archive 实时落库（2026-09-02 恢复原推流设计）
+
+        payload: {session_key, role, content, timestamp, session_id?}
+        - 内容+时间双重去重（与 watcher 时代同规则，防双路重复）
+        - 带 session_id 时顺手 upsert session_key_map（dashboard_key ← sessionId 身份中枢）
+        """
+        sk = (payload.get("session_key") or "").strip()
+        role = (payload.get("role") or "").strip()
+        content = payload.get("content") or ""
+        ts = payload.get("timestamp") or ""
+        sid = (payload.get("session_id") or "").strip()
+        if not sk or not role or not str(content).strip():
+            return {"ok": False, "error": "missing fields"}
+        # dashboard key 形如 agent:main:dashboard:<uuid>；普通 key 形如 agent:main:<uuid>
+        is_dashboard = "dashboard:" in sk
+        content_json = json.dumps(str(content), ensure_ascii=False)
+        with self.system.conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO conversations (session_key, role, content, timestamp)
+                SELECT %s, %s, %s::jsonb, %s::timestamptz
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM conversations
+                    WHERE session_key = %s AND role = %s
+                    AND content::text = %s
+                    AND timestamp >= %s::timestamptz - interval '5 seconds'
+                )
+            """, (sk, role, content_json, ts,
+                   sk, role, content_json, ts))
+            inserted = cur.rowcount
+            # 身份中枢：dashboard_key ← 当前 sessionId（/clear 换 id 也能追溯）
+            if is_dashboard and sid:
+                cur.execute("""
+                    INSERT INTO session_key_map (dashboard_key, jsonl_uuid, session_file)
+                    VALUES (%s, %s, NULL)
+                    ON CONFLICT (dashboard_key) DO UPDATE
+                    SET jsonl_uuid = EXCLUDED.jsonl_uuid, mapped_at = NOW()
+                """, (sk, f"agent:main:{sid}"))
+        self.system.conn.commit()
+        return {"ok": True, "inserted": inserted}
+
     def _conv_list(self, keyword):
         with self.system.conn.cursor() as cur:
             if keyword:
@@ -805,6 +860,21 @@ class Handler(BaseHTTPRequestHandler):
                     WHERE session_key LIKE %s ORDER BY timestamp, id
                 """, (f"%{key}%",))
                 rows = cur.fetchall()
+            # 三级：裸 sessionId → session_key_map 身份中枢换 dashboard_key 再查
+            # （sessionId /clear 后会变，map 表维护 dashboard_key ← 最新 sessionId）
+            if not rows:
+                cur.execute("""
+                    SELECT dashboard_key FROM session_key_map
+                    WHERE jsonl_uuid LIKE %s ORDER BY mapped_at DESC LIMIT 1
+                """, (f"%{key}%",))
+                mk = cur.fetchone()
+                if mk:
+                    cur.execute("""
+                        SELECT role, timestamp, content::text
+                        FROM conversations
+                        WHERE session_key = %s ORDER BY timestamp, id
+                    """, (mk[0],))
+                    rows = cur.fetchall()
             return [{"role": r[0], "timestamp": str(r[1]), "content": r[2][:2000]} for r in rows]
 
 
